@@ -14,8 +14,7 @@ import types
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tool"))
@@ -24,6 +23,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 import adb_link  # noqa: E402
 import chan_fast  # noqa: E402
 import entries  # noqa: E402
+import entries_family  # noqa: E402
+import family  # noqa: E402
 import fast  # noqa: E402
 import fixtures  # noqa: E402
 import recipe_meta  # noqa: E402
@@ -35,6 +36,7 @@ import row  # noqa: E402
 from fast import ScreenLocked  # noqa: E402
 from row import icon_hit  # noqa: E402
 from fixtures import (EMPTY_PAGE, Clock, clocked, fake_phone, load_recipe,  # noqa: E402
+                      shell_result,
                       phone_mock, phone_stub, stub)
 
 DOCS = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "docs" / "清单").glob("*.md")
@@ -71,22 +73,23 @@ class SourceTest(unittest.TestCase):
 
     def test_every_entry_has_a_source(self):
         used = entries.used_by(RECIPES)
-        for fam, groups in entries.ENTRIES.items():
-            for name, e in groups.items():
-                self.assertTrue(e.menu, f"{fam}·{name} 缺菜单路径")
-                for d in e.direct:
-                    if d.action:
-                        self.assertTrue(d.activity, f"{fam}·{name} 的 Intent 档缺落点页面")
-                        self.assertTrue(("intent", d.action, d.pkg) in used
-                                        or (d.action in DOCS and d.pkg in DOCS),
-                                        f"{fam}·{name} 的 Intent 入口 {d.action}（{d.pkg}）没有出处")
-                        continue
-                    key = ("direct", d.pkg, entries.full(d.pkg, d.activity))
-                    self.assertTrue(key in used or d.activity.lstrip(".") in DOCS,
-                                    f"{fam}·{name} 直达 {key} 没有出处")
-                for s in e.search:
-                    self.assertTrue(("search", s.keyword, s.result) in used or f"搜索「{s.keyword}」" in DOCS
-                                    or f"搜「{s.keyword}」" in DOCS, f"{fam}·{name} 搜索「{s.keyword}」没有出处")
+        for case in entries_family.CASES:
+            fam, name = case["family"], case["group"]
+            e = entries.ENTRIES[fam][name]
+            self.assertTrue(e.menu, f"{fam}·{name} 缺菜单路径")
+            for d in e.direct:
+                if d.action:
+                    self.assertTrue(d.activity, f"{fam}·{name} 的 Intent 档缺落点页面")
+                    self.assertTrue(("intent", d.action, d.pkg) in used
+                                    or (d.action in DOCS and d.pkg in DOCS),
+                                    f"{fam}·{name} 的 Intent 入口 {d.action}（{d.pkg}）没有出处")
+                    continue
+                key = ("direct", d.pkg, entries.full(d.pkg, d.activity))
+                self.assertTrue(key in used or d.activity.lstrip(".") in DOCS,
+                                f"{fam}·{name} 直达 {key} 没有出处")
+            for s in e.search:
+                self.assertTrue(("search", s.keyword, s.result) in used or f"搜索「{s.keyword}」" in DOCS
+                                or f"搜「{s.keyword}」" in DOCS, f"{fam}·{name} 搜索「{s.keyword}」没有出处")
 
     def test_every_brand_in_recipes_has_a_family_table(self):
         """脚本里出现过的品牌都要查得到。三星进目录时就是漏了这一步（#605）。"""
@@ -112,6 +115,18 @@ class SourceTest(unittest.TestCase):
         self.assertIsNotNone(entries.lookup("REDMI", "系统广告"))
         self.assertIsNone(entries.lookup("google", "系统广告"))
 
+    def test_freeme_family_collects_coolpad_and_5g(self):
+        """#1293：酷派 CPDAY3 读 `coolpad`、#455 那台读 `5G`，两台 `ro.build.freeme.label` 一致，同属卓易系。"""
+        self.assertEqual(entries.family("coolpad"), "freeme")
+        self.assertEqual(entries.family("5G"), "freeme")
+        # 家族名本身也要认：否则 recipes/freeme/ 被 scan_dir 的家族过滤静默丢掉，词库永远空。
+        self.assertEqual(entries.family("freeme"), "freeme")
+        e = entries.lookup("coolpad", "安全管家")
+        self.assertIsNotNone(e)
+        self.assertEqual(entries.source_key(e.direct[0]),
+                         ("direct", "com.freeme.secureguard",
+                          "com.zhuoyi.security.lite.SC_SettingActivity"))
+
     def test_used_by_reads_variable_packages(self):
         """honor-WKL-AN20 写的是 p.start(package, ".X")：只认字面量会把这台机漏掉。"""
         used = entries.used_by(RECIPES)
@@ -134,6 +149,51 @@ class SourceTest(unittest.TestCase):
         self.assertNotIn("PMX110", used[browser])  # PMX110 的浏览器走裸 `-n`，不是这个 Intent
         self.assertIn(("intent", "oppo.intent.action.APP_SETTINGS", "com.heytap.themestore"),
                       used)                        # 字面量：PKH110
+
+    def test_catalog_data_entry_facts_no_longer_need_the_am_start_regexes(self):
+        """catalog 数据里的拉起形状由 `start` op 提供（#1478）：把两条回读正则打死，数据派生的入口不变。
+
+        只扫数据、不带同目录 `<型号>.py` 例外：那批手写脚本与 `recipe_lib` 实现里的 `am start` 串
+        仍是正则的活（没有结构化形态），删了会整行丢掉「用过的机型」。这条钉的是数据这一侧——
+        哪天有人把 `am start` 写回 `shell` 串，`_AM_PAGE` / `_AM_INTENT` 一停摆就红。
+        """
+        data = {path.relative_to(ROOT / "recipes").as_posix():
+                recipe_source.scan_catalog(tomllib.loads(path.read_text(encoding="utf-8")))
+                for path in sorted((ROOT / "recipes").glob("*/*/*.toml"))}
+
+        def derived():
+            found = {}
+            for rel, item in data.items():
+                entries._scan_entries(item, rel.split("/")[1], found)
+            return found
+
+        before = derived()
+        # 不空转：`-n` 直达与公开 Intent 两档都得真在，否则下面的「一样」是两份空的
+        self.assertIn(("direct", "com.android.settings",
+                       "com.android.settings.ad.AdServiceSettings"), before)
+        self.assertIn(("intent", "oppo.intent.action.APP_SETTINGS",
+                       "com.heytap.themestore"), before)
+        with patch.object(entries, "_AM_PAGE", re.compile(r"(?!)")), \
+                patch.object(entries, "_AM_INTENT", re.compile(r"(?!)")):
+            self.assertEqual(derived(), before)
+
+    def test_a_start_op_with_action_and_package_is_a_public_intent(self):
+        """`start` op 的 `action` + `pkg` 在事实层是一个公开 Intent 入口（#1478）。
+
+        不写这条路，入口速查就得继续从生成的源码里正则回读 `-a … -p …`。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            model = Path(d) / "brand" / "model"
+            model.mkdir(parents=True)
+            (model / "model.toml").write_text(
+                '[[segment]]\nname = "a"\nops = [{kind = "start",'
+                ' action = "oppo.intent.action.APP_SETTINGS", pkg = "com.example.store"},'
+                ' {kind = "start", action = "android.settings.SETTINGS"}]\n',
+                encoding="utf-8")
+            self.assertEqual(entries.used_by(d),
+                             {("intent", "oppo.intent.action.APP_SETTINGS",
+                               "com.example.store"): {"model"}})
 
     def test_markdown_shows_the_public_intent_and_its_models(self):
         doc = entries.markdown(RECIPES)
@@ -251,6 +311,21 @@ class SourceTest(unittest.TestCase):
                          "改了 tool/entries.py 或机型脚本后重新生成：python3 tool/entries.py > docs/清单/入口速查.md")
 
 
+class EntriesFamilyTests(unittest.TestCase):
+    """族自己的两条守卫（#1401）：句柄与入口表对得上，case 行是纯数据。"""
+
+    def test_snapshot_and_handles_agree(self):
+        self.assertEqual(entries_family.FAMILY.violations(), [])
+
+    def test_case_rows_are_pure_data(self):
+        self.assertEqual(family.pure_data_violations(entries_family), [])
+
+    def test_every_id_is_the_canonical_spelling(self):
+        """`id` 是手写的，重复了 `family` / `group` 两个字段：改字段不改 id 今天没有守卫。"""
+        for case in entries_family.CASES:
+            self.assertEqual(case["id"], f"{case['family']}/{case['group']}", case["id"])
+
+
 class FakeReader:
     """读屏替身：按命令回前台与页面文字。`lands` 是这台「手机」进得去的包名/页面，
     `intents` 是公开 Intent 按包名落到的页面。"""
@@ -299,7 +374,7 @@ class FakeReader:
 
 def phone(reader):
     """一台带假读屏的 Phone，装配走 fixtures.phone_stub()。"""
-    return fixtures.phone_stub("test", d=reader, W=1080, H=2400)
+    return fixtures.phone_stub("test", reader=reader, W=1080, H=2400)
 
 
 class ReachTest(unittest.TestCase):
@@ -532,15 +607,15 @@ def shell_recorder_901(p, swipes, before=HOME_PAGE_901, after=ICON_PAGE_901, foc
             state["front"], state["home"] = LAUNCHER_901, True
         elif cmd.startswith("input swipe"):
             swipes.append(cmd)
-        return SimpleNamespace(output="", exit_code=0)
+        return shell_result("")
 
-    p.d.shell.side_effect = shell
+    p.shell.side_effect = shell
     p.focus.side_effect = lambda: state["front"]
     p.tree.side_effect = lambda: page_901(after if swipes else after_home if state["home"] else before)
 
 
 def commands_901(p):
-    return [call.args[0] for call in p.d.shell.call_args_list]
+    return [call.args[0] for call in p.shell.call_args_list]
 
 
 def load_901(p, recipe):
@@ -658,7 +733,7 @@ class AssistantEntryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "未停在系统桌面"):
                     load_901(p, recipe)["assistant_icon"]()
                 self.assertFalse(any("input swipe" in c.args[0]
-                                     for c in p.d.shell.call_args_list))
+                                     for c in p.shell.call_args_list))
 
     def test_missing_entry_reports_where_the_swipe_stopped(self):
         """认不到头像入口：输出带上停在哪个 Activity 与页面结构摘要，文案保持不变。"""
@@ -1138,7 +1213,7 @@ def expects_667(p):
 
 
 def shells_667(p):
-    return [c.args[0] for c in p.d.shell.call_args_list]
+    return [c.args[0] for c in p.shell.call_args_list]
 
 
 def fail_direct_667(pkg, activity=None, **kw):
@@ -1244,6 +1319,23 @@ class XiaomiTest(unittest.TestCase):
         self.assertEqual(expects_667(p), [None, "内容推广"])
         p.off.assert_called_once()
         self.assertEqual(p.off.call_args.kwargs["page"], "com.android.calendar·用户体验计划")
+
+    def test_the_calendar_page_that_never_opens_falls_back_to_the_menu(self):
+        """23049RAD8C：日历的用户体验计划页没导出时裸拉起首页、再从齿轮进去——天气那条路照常走。
+
+        旧树也绿（老 `.py` 的 `except Exception` 也走这条回退），守的是转成数据后不回退。"""
+        p = phone_667(fail_direct_667)
+        p.find.return_value = None
+        p.tree.return_value.iter.return_value = []
+        p.entry.return_value = True
+        p.tap.return_value = True
+        scope, _ = load_recipe(p, ROOT / "recipes/xiaomi/23049RAD8C/23049RAD8C.toml", only="天气和日历")
+        self.assertEqual(started_667(p), [("com.miui.weather2",),
+                                          ("com.android.calendar", ".settings.UserExperienceActionBarActivity"),
+                                          ("com.android.calendar",)])
+        self.assertEqual([c.kwargs["page"] for c in p.off.call_args_list],
+                         ["天气·用户体验计划", "日历·用户体验计划"])
+        self.assertEqual(scope["FAILED_STEPS"], [])
 
 
 class VivoTest(unittest.TestCase):
@@ -1757,6 +1849,15 @@ def calls_on_p_530(tree, method):
             and n.func.value.id == "p"]
 
 
+def _nested_ops(ops):
+    """按书写顺序摊平 `ops` / `else_ops`：条件分支里的入口也算这一段用到的入口。"""
+    for op in ops:
+        yield op
+        for key in ("ops", "else_ops"):
+            if key in op:
+                yield from _nested_ops(op[key])
+
+
 class VivoStoreEntryTests(unittest.TestCase):
     """vivo 参考脚本的商店段改用引擎入口，不再按精确文字点底栏（#530）。"""
 
@@ -1772,8 +1873,10 @@ class VivoStoreEntryTests(unittest.TestCase):
                     names = [a.value for call in calls_on_p_530(tree, "tab")
                              for a in call.args if isinstance(a, ast.Constant)]
                 else:
-                    # 数据段：require_tab 就是引擎的底带 p.tab()（ADR-0012）
-                    names = [op.get("name") for op in store["ops"] if op.get("kind") == "require_tab"]
+                    # 数据段：require_tab 就是引擎的底带 p.tab()（ADR-0012）。直达不通后的
+                    # 「我的 → 设置」回退写在 else_ops 里，所以要连嵌套子 op 一起看。
+                    names = [op.get("name") for op in _nested_ops(store["ops"])
+                             if op.get("kind") == "require_tab"]
                 self.assertIn("我的", names, "商店段没改用 p.tab(\"我的\")")
 
 
@@ -1883,9 +1986,9 @@ def page_texts_796(*labels, top=100):
 
 
 def home_presses_796(p):
-    """按 HOME 的次数：shell 与 `d.press` 两条路都算。"""
-    return ([c.args[0] for c in p.d.shell.call_args_list if "keyevent HOME" in c.args[0]]
-            + [c.args[0] for c in p.d.press.call_args_list if c.args[0] == "home"])
+    """按 HOME 的次数：shell 与门面 `press` 两条路都算。"""
+    return ([c.args[0] for c in p.shell.call_args_list if "keyevent HOME" in c.args[0]]
+            + [c.args[0] for c in p.press.call_args_list if c.args[0] == "home"])
 
 
 def landing_failed_796(pkg, activity=None, **kw):
@@ -1919,9 +2022,9 @@ class PnmNegativeScreenEntryTests(unittest.TestCase):
         p = phone_796(find=lambda text, **kw: object() if text == "头像" else None)
         scope, _ = load_796(p, PNM_796, "负一屏")
         self.assertEqual(scope["FAILED_STEPS"], [])
-        self.assertEqual(p.d.shell.call_args_list[0].args[0], HIBOARD_START_796)
+        self.assertEqual(p.shell.call_args_list[0].args[0], HIBOARD_START_796)
         self.assertEqual(home_presses_796(p), [])
-        self.assertEqual(len(p.d.shell.call_args_list), 1)
+        self.assertEqual(len(p.shell.call_args_list), 1)
         p.tap.assert_any_call("头像", exact=True, scrolls=0)
 
     def test_negative_screen_falls_back_to_the_swipe_when_the_activity_does_not_land(self):
@@ -1930,9 +2033,9 @@ class PnmNegativeScreenEntryTests(unittest.TestCase):
         scope, out = load_796(p, PNM_796, "负一屏")
         self.assertEqual(scope["FAILED_STEPS"], ["负一屏"])
         self.assertIn("负一屏没打开", out)
-        self.assertEqual(p.d.shell.call_args_list[0].args[0], HIBOARD_START_796)
+        self.assertEqual(p.shell.call_args_list[0].args[0], HIBOARD_START_796)
         self.assertEqual(len(home_presses_796(p)), 1)
-        self.assertTrue(any("input swipe" in c.args[0] for c in p.d.shell.call_args_list))
+        self.assertTrue(any("input swipe" in c.args[0] for c in p.shell.call_args_list))
 
 
 class PnmAdTrackingEntryTests(unittest.TestCase):
@@ -1966,7 +2069,11 @@ class PnmAdTrackingEntryTests(unittest.TestCase):
         p.setting.assert_not_called()
 
     def test_ad_tracking_does_not_swallow_a_locked_screen(self):
-        """锁屏同理：上抛给上层停段，不静默换入口。"""
+        """锁屏同理：上抛给上层停段，不静默换入口。
+
+        这条是人为让 `p.start` 抛 `ScreenLocked` 的守卫，不是生产路径：当前 `p.start` 落点不对时抛的
+        是普通 `RuntimeError`，锁屏只在 `rt.page` 与段前检查里抛，`opened()` 的 `ScreenLocked` 分支是
+        给将来会抛它的调用方留的。"""
         p = phone_796()
         p.start.side_effect = ScreenLocked("手机锁屏")
         scope, _ = load_796(p, PNM_796, "广告跟踪")
@@ -1981,9 +2088,9 @@ class PlrSearchEntryTests(unittest.TestCase):
                   texts=lambda: page_texts_796("搜索范围"))
         scope, _ = load_796(p, PLR_796, "下拉搜索")
         self.assertEqual(scope["FAILED_STEPS"], [])
-        self.assertEqual(p.d.shell.call_args_list[0].args[0], SEARCH_SETTING_796)
+        self.assertEqual(p.shell.call_args_list[0].args[0], SEARCH_SETTING_796)
         self.assertEqual(home_presses_796(p), [])
-        self.assertFalse(any("input swipe" in c.args[0] for c in p.d.shell.call_args_list))
+        self.assertFalse(any("input swipe" in c.args[0] for c in p.shell.call_args_list))
         p.tap.assert_any_call("搜索范围", exact=True)
 
     def test_pull_down_search_falls_back_to_the_desktop_gesture(self):
@@ -1993,9 +2100,9 @@ class PlrSearchEntryTests(unittest.TestCase):
         self.assertEqual(scope["FAILED_STEPS"], ["下拉搜索"])
         self.assertIn("下拉没进全局搜索", out)
         self.assertIn("没进全局搜索设置页", out)
-        self.assertEqual(p.d.shell.call_args_list[0].args[0], SEARCH_SETTING_796)
+        self.assertEqual(p.shell.call_args_list[0].args[0], SEARCH_SETTING_796)
         self.assertEqual(len(home_presses_796(p)), 1)
-        self.assertTrue(any("input swipe" in c.args[0] for c in p.d.shell.call_args_list))
+        self.assertTrue(any("input swipe" in c.args[0] for c in p.shell.call_args_list))
 
 
 # ---------- 来源 tests/test_store_privacy_933.py ----------
@@ -2281,7 +2388,9 @@ class StoreSegmentTests(unittest.TestCase):
 
     def test_rmx3700_passes_both_wording(self):
         scope = self.segment("RMX3700", "软件商店", tap_by_scroll=True, wait_page=True)
-        self.assertIn(PRIVACY_933, [c.args[0] for c in scope["tap_by_scroll"].call_args_list])
+        passed = [c.args[0] for c in scope["tap_by_scroll"].call_args_list]
+        # 页面树里写的是 TOML 数组（list），与别处那条一样按内容比。
+        self.assertIn(list(PRIVACY_933), passed)
 
     def test_phk110_passes_both_wording(self):
         scope = self.segment("PHK110", "软件商店个性化",
@@ -2559,7 +2668,7 @@ def literal_730(node):
 
 
 def monkey_shells_730(tree):
-    """`p.d.shell("… monkey … com.android.thememanager …")`：注定 abort 的那条命令。"""
+    """`p.shell("… monkey … com.android.thememanager …")`：注定 abort 的那条命令。"""
     hits = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not node.args:
@@ -2621,9 +2730,9 @@ class ThemeFallbackBehaviourTests(unittest.TestCase):
         def shell(command, timeout=None):
             for package, output in paths.items():
                 if command == f"pm path {package}":
-                    return SimpleNamespace(output=output, exit_code=0)
-            return SimpleNamespace(output="", exit_code=0)
-        p.d.shell.side_effect = shell
+                    return shell_result(output)
+            return shell_result("")
+        p.shell.side_effect = shell
         out = io.StringIO()
         scope, _ = load_recipe(p, path, only="主题", out=out)
         return p, out.getvalue(), scope
@@ -2634,7 +2743,7 @@ class ThemeFallbackBehaviourTests(unittest.TestCase):
             with self.subTest(recipe=path.parent.name):
                 p, _, _ = self.load(path, "", "package:/system/app/ThemeManager/ThemeManager.apk")
                 # 只比对拉起那一步：往后的「我的 → 齿轮」与开关校验由 #906 的用例守
-                p.d.shell.assert_any_call(f"pm path {THEME}")
+                p.shell.assert_any_call(f"pm path {THEME}")
                 p.start.assert_called_once_with(THEME, DIRECT)
 
     # 缺失主题管理包时按跳过收尾的那条判据由 #906 / #902 一起守（覆盖全部脚本），这里不再重复。
@@ -2840,6 +2949,37 @@ def verifies_switches_906(ops):
     return False
 
 
+def _walk_toml_ops(value):
+    """一份 catalog 数据里所有 op 表（含 `ops` / `else_ops` 与实参回调块）。"""
+    if isinstance(value, dict):
+        if "kind" in value:
+            yield value
+        for inner in value.values():
+            yield from _walk_toml_ops(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from _walk_toml_ops(inner)
+
+
+class ThemeDeadEndsSingleSourceTests(unittest.TestCase):
+    """`THEME_DEAD_ENDS` 的唯一 owner 是 `tool/entries.py`，十份小米数据里抄的是同一份值。
+
+    旧树也绿，守的是单一来源不漂移：改了库常量而数据没跟着改（或反过来），这里报红。"""
+
+    def test_xiaomi_start_or_skip_dead_ends_match_the_library_constant(self):
+        found = []
+        for path in sorted(Path(RECIPES).glob("xiaomi/**/*.toml")):
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            for op in _walk_toml_ops(data):
+                if op.get("kind") == "start_or_skip" and "dead_ends" in op:
+                    found.append((path, frozenset(op["dead_ends"])))
+        self.assertTrue(found, "一份小米 start_or_skip 的 dead_ends 都没扫到：发现口径坏了")
+        for path, dead_ends in found:
+            with self.subTest(recipe=str(path.relative_to(ROOT))):
+                self.assertEqual(dead_ends, entries.THEME_DEAD_ENDS,
+                                 "数据里的 dead_ends 与 entries.THEME_DEAD_ENDS 不一致")
+
+
 class ThemeLandingGuardTests(unittest.TestCase):
     def test_every_theme_recipe_is_discovered(self):
         """发现口径：`.toml` 与 `.py` 两条路对「哪份脚本有主题段」要给同一个答案（#1266）。"""
@@ -2895,7 +3035,7 @@ class ThemeSettingsLandingTests(unittest.TestCase):
 
         def shell(command, timeout=None):
             return SimpleShell(INSTALLED_906 if command == f"pm path {THEME_906}" else "")
-        p.d.shell.side_effect = shell
+        p.shell.side_effect = shell
         p.switches.side_effect = lambda *a, **k: [(name, on, (900, 500)) for name, on in rows.items()]
 
         def fake_off(*a, only=None, **k):
@@ -2963,21 +3103,19 @@ class ThemeUnreachableStillSkippedTests(unittest.TestCase):
             with self.subTest(recipe=str(path.relative_to(ROOT))):
                 p = phone_mock()
                 p.locked = lambda: False
-                p.d.shell = Mock(return_value=SimpleShell(""))
+                p.shell.return_value = shell_result("")
                 out = io.StringIO()
                 scope, _ = load_recipe(p, path, only="主题", out=out)
                 self.assertEqual(scope["SKIPPED_STEPS"], [])
                 self.assertEqual(scope["FAILED_STEPS"], [])
                 self.assertIn("本机没有主题管理包，跳过", out.getvalue())
-                p.d.shell.assert_any_call(f"pm path {THEME_906}")
+                p.shell.assert_any_call(f"pm path {THEME_906}")
                 p.start.assert_not_called()
 
 
-class SimpleShell:
-    """`p.d.shell` 的返回形状：只要 output / exit_code。"""
-
-    def __init__(self, output=""):
-        self.output, self.exit_code = output, 0
+def SimpleShell(output=""):     # noqa: N802 - 旧名字，调用点很多，保留
+    """`p.shell` 的返回形状：是字符串，另带 `exit_code`（#1474 起与门面返回同一个类型）。"""
+    return shell_result(output)
 
 
 # ---------- 来源 tests/test_theme_unreachable_902.py ----------
@@ -3009,10 +3147,10 @@ class ThemeUnreachableTests(unittest.TestCase):
         def shell(command, timeout=None):
             for package, output in installed.items():
                 if command == "pm path " + package:
-                    return SimpleNamespace(output=output, exit_code=0)
-            return SimpleNamespace(output="", exit_code=0)
+                    return shell_result(output)
+            return shell_result("")
 
-        p.d.shell.side_effect = shell
+        p.shell.side_effect = shell
         # 落点只认 `Phone.start` 报错里带着的那份；抛错之后再读前台有窗口期，故意让它读成别的。
         p.screen.focus = lambda: "com.example.stale/.Main"
         p.start.side_effect = RuntimeError(
@@ -3026,7 +3164,7 @@ class ThemeUnreachableTests(unittest.TestCase):
         """只装了主题管理包、没有主题商店：脚本会走代理页兜底。"""
         def shell(command, timeout=None):
             installed = command == "pm path " + THEME_902
-            return SimpleNamespace(output="package:/system/app/ThemeManager/ThemeManager.apk"
+            return shell_result("package:/system/app/ThemeManager/ThemeManager.apk"
                                    if installed else "", exit_code=0)
         return shell
 
@@ -3072,7 +3210,7 @@ class ThemeUnreachableTests(unittest.TestCase):
         p = phone_mock()
         p.locked = lambda: False
         p.screen.focus = lambda: LAUNCHER_902
-        p.d.shell.side_effect = self.manager_only()
+        p.shell.side_effect = self.manager_only()
         p.start.side_effect = RuntimeError(f"无法打开 {THEME_902}：** No activities found to run")
         out = io.StringIO()
         scope, _ = load_recipe(p, ROOT / "recipes/xiaomi/24129PN74C/24129PN74C.toml", only="主题", out=out)
@@ -3085,7 +3223,7 @@ class ThemeUnreachableTests(unittest.TestCase):
         p = phone_mock()
         p.locked = lambda: False
         p.screen.focus = lambda: LAUNCHER_902
-        p.d.shell.side_effect = self.manager_only()
+        p.shell.side_effect = self.manager_only()
         p.start.side_effect = adb_link.DeviceLost("device offline")
         with self.assertRaises(adb_link.DeviceLost):
             load_recipe(p, ROOT / "recipes/xiaomi/24129PN74C/24129PN74C.toml", only="主题", out=io.StringIO())

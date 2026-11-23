@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import host
+from plan import StepKind
 
 
 def note(run: Mapping[str, Any], on_phone: bool) -> str:
@@ -19,6 +20,9 @@ def note(run: Mapping[str, Any], on_phone: bool) -> str:
     `on_phone` 只影响措辞：桌面宿主传 `False`，手机版的 `view.poll()` 传 `True`。
     """
     results = run.get("results") or []
-    if not any(r.get("kind") == "recipe" and not r.get("skipped") for r in results):
+    if not any(r.get("kind") == StepKind.RECIPE and not r.get("skipped") for r in results):
         return ""
-    return host.coverage_notes(on_phone).get(run.get("recipe_coverage") or "", "")
+    # 这一行只表达「没有档位」：`coverage_notes` 的键只有「部分」「未记录」两档，缺档时占位串与
+    # None 都落到下一行的空串默认值，所以整行标等价；下一行的 `.get` 默认值仍由用例判。
+    tier = run.get("recipe_coverage") or ""   # pragma: no mutate 语义等价
+    return host.coverage_notes(on_phone).get(tier, "")

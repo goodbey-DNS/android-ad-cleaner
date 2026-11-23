@@ -25,11 +25,15 @@ FAMILY = {
     "oppo": "oppo", "oneplus": "oppo", "realme": "oppo",
     "vivo": "vivo", "iqoo": "vivo",
     "honor": "honor", "huawei": "huawei", "meizu": "meizu", "samsung": "samsung",
+    # 卓易 FreemeOS 的两个贴牌线：酷派 CPDAY3 读 coolpad，#455 那台读 5g，两台 `ro.build.freeme.label` 一致。
+    # 家族名本身也要在表里：`recipe_source.scan_dir()` 按目录名过滤，缺这一行时 `recipes/freeme/` 的脚本
+    # 会被词库与同族参考静默丢掉。
+    "freeme": "freeme", "coolpad": "freeme", "5g": "freeme",
 }
 
 # 家族在文档里的写法。
 LABEL = {"xiaomi": "小米", "oppo": "OPPO", "vivo": "vivo", "honor": "荣耀",
-         "huawei": "华为", "meizu": "魅族", "samsung": "三星"}
+         "huawei": "华为", "meizu": "魅族", "samsung": "三星", "freeme": "卓易 FreemeOS"}
 
 # 没有主题商店的小米 / 红米机型上，主题管理包的代理页会被系统转去这两个包：应用商店详情页
 # 或桌面。落在这里说明主题设置不可达，段体按跳过收尾（#902）。
@@ -248,6 +252,14 @@ ENTRIES = {
             menu="设置 → 应用程序通知 → 选择应用 → 通知类别 → 分组名 → 渠道名",
             note="One UI 4 首层没有渠道行，chan-off 停在这一层报「同名 0 行」，只能照清单手动关"),
     },
+    "freeme": {
+        "安全管家": Entry(
+            menu="安全管家 → 设置 → 关于我们 → 个性化广告",
+            direct=(Direct("com.freeme.secureguard", "com.zhuoyi.security.lite.SC_SettingActivity", ""),),
+            note="裸启动 com.freeme.secureguard 会被转到 ...SC_SettingActivity，按包名判「没进前台」，"
+                 "所以直达写转过去的那一页；「个性化广告」在 关于我们（AboutMeActivity）里，本机点开关本体与"
+                 "行标题都不动、无确认框，见 docs/清单/FreemeOS.md（CPDAY3，#1293）"),
+    },
 }
 
 
@@ -296,8 +308,9 @@ def source_key(d):
 # `.format(…)`）由事实层先把字符串还原出来，这里只认还原后的整条命令。
 _AM_PAGE = re.compile(r"am start\b[^\n]*?-n\s+([\w.]+)/([\w.$]+)")
 _AM_INTENT = re.compile(r"am start\b[^\n]*?-a\s+([\w.]+)[^\n]*?-p\s+([\w.]+)")
-# 拉起入口的调用名：Phone.start 与共享的 start_or_skip 助手（沿用 #902）。
-_START_CALLS = frozenset({"p.start", "start_or_skip", "rt.start_or_skip"})
+# 拉起入口的调用名：Phone.start 与按 (包名, 页面名) 收实参的助手（沿用 #902、#1364、#1365、#1372）。
+_START_CALLS = frozenset({"p.start", "start_or_skip", "rt.start_or_skip", "direct_page",
+                          "direct_start", "global_search_entry", "store_settings_direct"})
 
 
 def _value(arg):
@@ -317,6 +330,11 @@ def _arg_of(call, index, keyword=None):
         return positional[index]
     if keyword is None:
         return None
+    return _kwarg(call, keyword)
+
+
+def _kwarg(call, keyword):
+    """只按关键字取的实参：`start` op 降级出的 `action=`（#1478）就是这一类，没有位置。"""
     for arg in call.args:
         if arg.keyword == keyword:
             return arg
@@ -338,6 +356,10 @@ def _scan_entries(facts, model, found):
             pkg, act = _value(_arg_of(call, 0)), _value(_arg_of(call, 1, "activity"))
             if pkg and act:
                 found.setdefault(("direct", pkg, full(pkg, act)), set()).add(model)
+            # `start` op 的公开 Intent（#1478）：`action` 只按关键字来，与 `-a … -p …` 同一条入口。
+            action = _value(_kwarg(call, "action"))
+            if pkg and action:
+                found.setdefault(("intent", action, pkg), set()).add(model)
         elif call.name == "p.setting":
             keyword = _value(_arg_of(call, 0))
             if keyword:
@@ -393,7 +415,7 @@ def open_direct(p, d, settle=1.2):
         p.start(d.pkg, d.activity, settle=settle)
         return
     page = full(d.pkg, d.activity)
-    result = p.reader.shell(start_command(d))
+    result = p.shell(start_command(d))
     if getattr(result, "exit_code", 0) or re.search(r"Error|Exception", result.output or "", re.I):
         raise RuntimeError(f"无法打开 {page}：{(result.output or '').strip()[-200:]}")
 

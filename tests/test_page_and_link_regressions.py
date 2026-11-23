@@ -24,7 +24,7 @@ from fixtures import fake_adb, phone_stub
 
 
 def page(xml, focus, w=1080, h=2340):
-    p = phone_stub("test", d=Mock())
+    p = phone_stub("test", reader=Mock())
     p.W, p.H = w, h
     p.locked = Mock(return_value=False)
     p.screen.focus = Mock(return_value=focus)
@@ -61,6 +61,7 @@ INLINE_PAGE = '''<hierarchy><node>
 
 
 class PageIdentityTests(unittest.TestCase):
+    DOMAIN = "channel"
     def test_honor_systemmanager_channel_page_is_trusted(self):
         # #86 PTP-AN00 实测 Activity
         p = page(CHANNEL_PAGE, "com.hihonor.systemmanager/com.hihonor.notificationmanager.ui.NotificationSettingsActivity")
@@ -101,6 +102,7 @@ class PageIdentityTests(unittest.TestCase):
 
 
 class InlineChannelTests(unittest.TestCase):
+    DOMAIN = "channel"
     focus = "com.android.settings/com.android.settings.Settings$AppNotificationSettingsActivity"
 
     def test_inline_row_switch_is_picked_by_exact_title(self):
@@ -131,6 +133,7 @@ def snap(target_on=True, other_on=True, app_off=False):
 
 @patch.object(chan.time, "sleep")
 class SideEffectTests(unittest.TestCase):
+    DOMAIN = "channel"
     def phone(self):
         return page(CHANNEL_PAGE, "com.android.settings/.Settings$ChannelNotificationSettingsActivity")
 
@@ -196,17 +199,17 @@ DUMP = """PackagePreferences:
 
 
 class ParseTests(unittest.TestCase):
+    DOMAIN = "channel"
     def test_other_user_spaces_do_not_override_owner(self):
         # #95 / 小米双开：另一空间同包名同渠道仍开着，不能当成机主空间没关
-        d, app_off = chan.parse(types.SimpleNamespace(d=types.SimpleNamespace(
-            shell=lambda *a, **k: types.SimpleNamespace(output=DUMP))))
+        d, app_off = chan.parse(types.SimpleNamespace(
+            shell=lambda *a, **k: types.SimpleNamespace(output=DUMP)))
         self.assertEqual(d[("com.ss.android", "promo")][1], 0)
         self.assertNotIn(("com.dual.only", "x"), d)
         self.assertNotIn("com.dual.only", app_off)
 
     def test_truncated_ids_are_left_out_of_scan(self):
         reader = types.SimpleNamespace(shell=lambda *a, **k: types.SimpleNamespace(output=DUMP))
-        reader.d = reader
         err = io.StringIO()
         with patch.object(chan, "ShellPhone", return_value=reader), \
              patch.object(sys, "argv", ["chan_fast.py", "-s", "test", "scan"]), \
@@ -217,6 +220,7 @@ class ParseTests(unittest.TestCase):
 
 
 class LockedChannelTests(unittest.TestCase):
+    DOMAIN = "channel"
     DUMP = """PackagePreferences:
   AppSettings: com.motorola.sim (1001) importance=DEFAULT userSet=false fixedImportance=true
     NotificationChannel{mId='sim_promo', mName=智能 SIM 推荐通知, mDescription=, mImportance=3, mBlockableSystem=false, mDeleted=false}
@@ -227,7 +231,6 @@ class LockedChannelTests(unittest.TestCase):
     def test_scan_leaves_out_system_locked_channels(self):
         # #134：系统锁定的渠道开关是灰的，列进清单只会报「状态未改变」
         reader = types.SimpleNamespace(shell=lambda *a, **k: types.SimpleNamespace(output=self.DUMP))
-        reader.d = reader
         with patch.object(chan, "ShellPhone", return_value=reader), \
              patch.object(sys, "argv", ["chan_fast.py", "-s", "test", "scan"]), \
              contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
@@ -244,8 +247,9 @@ class LockedChannelTests(unittest.TestCase):
 
 
 class DismissTests(unittest.TestCase):
+    DOMAIN = "navigation"
     def phone(self, xml):
-        p = phone_stub("test", d=Mock())
+        p = phone_stub("test", reader=Mock())
         p.W, p.H = 1272, 2772
         p.screen.tree = Mock(return_value=ET.fromstring(xml))
         p.screen.focus = Mock(return_value="com.oplus.securitypermission/.privacy.PrivacySecuritySettingsDashboardActivity")
@@ -306,9 +310,10 @@ class DismissTests(unittest.TestCase):
 
 class BottomBarWaitTests(unittest.TestCase):
     """底栏按钮在应用内更新弹窗晚到时也要等到它被关掉（#286）。"""
+    DOMAIN = "navigation"
 
     def tap_after(self, found_at):
-        p = phone_stub("test", W=1272, H=2772, d=Mock())
+        p = phone_stub("test", W=1272, H=2772, reader=Mock())
         p.say = Mock()
         p.screen.sig = Mock(return_value="page")
         p.screen.settle = Mock(return_value=True)
@@ -333,6 +338,7 @@ class BottomBarWaitTests(unittest.TestCase):
 
 
 class ScanWordingTests(unittest.TestCase):
+    DOMAIN = "channel"
     def test_overlay_notice_is_not_a_marketing_candidate(self):
         # #115：小米「“钱包”正在其他应用的上层显示内容」被当成营销渠道，整步报失败
         self.assertTrue(chan.classify("“钱包”正在其他应用的上层显示内容").scan_excluded)
@@ -354,6 +360,7 @@ class ScanWordingTests(unittest.TestCase):
 
 
 class SearchBoxTests(unittest.TestCase):
+    DOMAIN = "navigation"
     def test_autocomplete_search_box_counts_as_input(self):
         # 荣耀 PNM-AN10 10.0.0.102 真机：设置搜索框是 AutoCompleteTextView，以前判成「搜索框没打开」
         p = phone_stub("test")
@@ -365,26 +372,34 @@ class SearchBoxTests(unittest.TestCase):
 
 
 class LockScreenTests(unittest.TestCase):
+    DOMAIN = "device_state"
     def test_other_true_fields_on_the_line_are_not_a_lock(self):
         # #115 跟帖：HyperOS 3 全程解锁，30 个渠道都被判成「手机锁屏了」
-        p = phone_stub("test", d=Mock())
-        p.d.shell.return_value = types.SimpleNamespace(output="    isKeyguardShowing=false mKeyguardOccluded=true\n")
+        p = phone_stub("test", reader=Mock())
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output="    isKeyguardShowing=false mKeyguardOccluded=true\n")
         self.assertFalse(p.locked())
-        p.d.shell.return_value = types.SimpleNamespace(output="    isKeyguardShowing=true\n")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output="    isKeyguardShowing=true\n")
         self.assertTrue(p.locked())
 
 
 class XiaomiInputTests(unittest.TestCase):
+    DOMAIN = "switch"
     MIUI = ("java.lang.SecurityException: Injecting to another application requires INJECT_EVENTS permission\n"
             "\tat android.os.Parcel.createExceptionOrNull")
 
     def test_blocked_click_names_the_security_setting(self):
         p = page("<hierarchy/>", "x/y")
         del p.click, p.screen.click
-        p.d.window_size.return_value = (1080, 2340)
-        p.d.shell.return_value = types.SimpleNamespace(output=self.MIUI, exit_code=1)
+        p.conn.reader.window_size.return_value = (1080, 2340)
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output=self.MIUI, exit_code=1)
         with self.assertRaisesRegex(RuntimeError, "USB 调试（安全设置）"):
             p.click(500, 500)
+
+
+class XiaomiStatusProbeTests(unittest.TestCase):
+    DOMAIN = "connection"
+    MIUI = ("java.lang.SecurityException: Injecting to another application requires INJECT_EVENTS permission\n"
+            "\tat android.os.Parcel.createExceptionOrNull")
 
     def test_status_probe_only_runs_for_xiaomi_family(self):
         with patch.object(run, "sh_all", return_value=self.MIUI) as sh_all:
@@ -395,6 +410,7 @@ class XiaomiInputTests(unittest.TestCase):
 
 
 class AdbLinkTests(unittest.TestCase):
+    DOMAIN = "connection"
     def setUp(self):
         fake_adb(self)
 
@@ -440,6 +456,7 @@ class AdbLinkTests(unittest.TestCase):
 
 
 class KeepAwakeTests(unittest.TestCase):
+    DOMAIN = "device_state"
     def test_failed_write_warns_and_returns_original(self):
         calls = []
         def shell(cmd, timeout=60):
@@ -453,6 +470,7 @@ class KeepAwakeTests(unittest.TestCase):
 
 
 class GuiTests(unittest.TestCase):
+    DOMAIN = "connection"
     def setUp(self):
         self.app = app
         self.data = tempfile.TemporaryDirectory()
@@ -496,6 +514,30 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.app.usb_hw_id("USB\\VID_2717&PID_FF40"), "USB\\VID_2717&PID_FF40")
         self.assertEqual(self.app.usb_hw_id("HDAUDIO\\FUNC_01&VEN_10EC"), "")
         self.assertEqual(self.app.usb_hw_id(""), "")
+        self.assertEqual(self.app.usb_hw_id(None), "")
+        # 注册表给的 VID / PID 大小写不固定：小写同样认得出，且原样保留
+        self.assertEqual(self.app.usb_hw_id("usb\\vid_2717&pid_ff40\\5e3d4f6b"),
+                         "usb\\vid_2717&pid_ff40")
+
+    def test_usb_facts_render_each_verdict_and_the_missing_hardware_id_verbatim(self):
+        self.assertEqual(
+            self.app.usb_facts([("华为", "HUAWEI M30", "OK", False, "USB\\VID_12D1&PID_107E", None)]),
+            ["华为 HUAWEI M30（OK，非调试接口）硬件 ID：USB\\VID_12D1&PID_107E"])
+        self.assertEqual(self.app.usb_facts([("小米", "MI 15", "Error", False, "", None)]),
+                         ["小米 MI 15（Error，非调试接口）硬件 ID：未识别"])
+
+    def test_usb_hint_without_a_driver_hint_ends_after_the_advice(self):
+        # 只给 DRIVER_HINT 里那三个品牌配驱动提示，其余品牌那句话说完就结束
+        self.assertEqual(
+            self.app.usb_hint([("小米", "MI 15", "OK", True, "USB\\VID_2717&PID_FF40", None)]),
+            "电脑识别到小米手机的调试接口，但 adb 没连上：请退出手机助手类软件和模拟器后重新插线。")
+
+    def test_usb_hint_multi_phone_reports_each_brand_with_its_own_state(self):
+        found = [("荣耀", "ADB Interface", "OK", True, "USB\\VID_339B&PID_107D&MI_02", None),
+                 ("华硕", "ROG Phone", "Error", True, "USB\\VID_0B05&PID_1ABC", None)]
+        self.assertEqual(self.app.usb_hint(found),
+                         "电脑识别到多台手机：荣耀（调试接口在，但 adb 没连上）、"
+                         "华硕（调试接口的驱动没有装好）。只留要处理的那一台插着，重新插线后再检测。")
 
     def test_usb_facts_render_one_line_per_hit_device(self):
         facts = self.app.usb_facts([("三星", "Galaxy S25", "OK", True, "USB\\VID_04E8&PID_6860&MI_00", None)])
@@ -563,6 +605,12 @@ class GuiTests(unittest.TestCase):
         with patch.object(adb_link, "invoke", return_value=new) as invoke:
             self.assertTrue(self.app.adb_ok("adb"))
         invoke.assert_called_once_with("adb", "version", timeout=8)
+
+
+class GuiClipboardTests(unittest.TestCase):
+    DOMAIN = "desktop"
+    def setUp(self):
+        self.app = app
 
     @unittest.skipUnless(sys.platform == "win32", "Windows 剪贴板")
     def test_windows_clipboard_round_trips_chinese(self):

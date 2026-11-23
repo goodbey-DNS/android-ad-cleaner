@@ -15,15 +15,15 @@ sys.path.insert(0, str(ROOT / "tool"))
 sys.path.insert(0, str(ROOT / "tests"))
 import run
 from fixtures import load_recipe, phone_mock
+import recipe_case
+from recipe_case import walk
 
 RECIPE = ROOT / "recipes/xiaomi/M332BF/M332BF.toml"
 EXCEPTIONS = ROOT / "recipes/xiaomi/M332BF/M332BF.py"
 
 
-class K90UltraRecipeTests(unittest.TestCase):
-    def setUp(self):
-        self.path = RECIPE
-        self.source = self.path.read_text(encoding="utf-8")
+class K90UltraRecipeTests(recipe_case.RecipeSourceCase):
+    RECIPE = RECIPE
 
     def phone(self):
         p = phone_mock()
@@ -49,7 +49,7 @@ class K90UltraRecipeTests(unittest.TestCase):
         # p.start() 启动后会跑 dismiss()，#374 的开关说明行含「关闭」会被当成弹窗 ✕ 点掉
         p = self.phone()
         load_recipe(p, self.path, ["系统广告"])
-        p.d.shell.assert_any_call(
+        p.shell.assert_any_call(
             "am start -f 0x10008000 -n com.android.settings/.ad.AdServiceSettings")
         p.start.assert_not_called()
 
@@ -72,7 +72,7 @@ class K90UltraRecipeTests(unittest.TestCase):
     def test_every_switch_page_names_the_switches_it_touches(self):
         # 不整页全关：数据里的每一条 off 都点名 only；例外函数里的 p.off 同理。
         data = tomllib.loads(self.source)
-        offs = [op for segment in data["segment"] for op in _walk(segment.get("ops", []))
+        offs = [op for segment in data["segment"] for op in walk(segment.get("ops", []))
                 if op.get("kind") in ("off", "off_required")]
         self.assertTrue(offs)
         for op in offs:
@@ -80,10 +80,10 @@ class K90UltraRecipeTests(unittest.TestCase):
         named = {(op["page"], tuple(op["only"]), tuple(op.get("keep", []))) for op in offs}
         self.assertIn(("系统·广告服务", ("个性化广告推荐",), ()), named)
         self.assertIn(("浏览器·隐私和安全", ("个性化内容推荐", "个性化广告推荐"), ()), named)
-        # 主题段整段留在例外函数里：那一条 off 的 only / keep 在源码里点名。
-        source = EXCEPTIONS.read_text(encoding="utf-8")
-        self.assertIn('p.off(only=["每次联网时通知"], keep=["自动更新"], page="主题·设置")', source)
-        calls = [n for n in ast.walk(ast.parse(source))
+        self.assertIn(("主题·设置", ("每次联网时通知",), ("自动更新",)), named)
+        self.assertIn(("主题·隐私", ("个性化推荐",), ()), named)
+        # 例外函数里也不许出现不带名单的 off()。
+        calls = [n for n in ast.walk(ast.parse(EXCEPTIONS.read_text(encoding="utf-8")))
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "off"]
         for call in calls:
@@ -96,15 +96,12 @@ class K90UltraRecipeTests(unittest.TestCase):
         self.assertIn('p.find("设置", exact=True, edge_ok="tab")',
                       "\n".join(path.read_text(encoding="utf-8")
                                 for path in sorted((ROOT / "recipe_lib").glob("*.py"))))
-        self.assertIn("import recipe_nav as nav", EXCEPTIONS.read_text(encoding="utf-8"))
+        theme = next(segment for segment in tomllib.loads(self.source)["segment"]
+                     if segment["name"] == "主题")
+        gears = [op for op in walk(theme["ops"]) if op.get("name") == "gear"]
+        self.assertTrue(gears, "主题段的设置入口要走家族库的 gear")
+        self.assertTrue(all(op.get("fail") for op in gears), "齿轮点不到要按这一段失败收尾")
 
-
-def _walk(ops):
-    """展开带分支的 op（if_entry / if_lib_any …）里的子表。"""
-    for op in ops:
-        yield op
-        yield from _walk(op.get("ops", []))
-        yield from _walk(op.get("else_ops", []))
 
 
 if __name__ == "__main__":

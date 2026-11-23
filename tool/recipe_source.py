@@ -116,8 +116,8 @@ class Facts:
     import_lines: Mapping[str, int] = field(default_factory=dict)
 
 
-def _string_value(node: ast.AST) -> str | None:
-    """字符串字面量的值；不是字符串常量时 None。"""
+def _string_value(node: ast.AST | None) -> str | None:
+    """字符串字面量的值；不是字符串常量（含 `{**other}` 的 None 键）时 None。"""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     return None
@@ -169,7 +169,7 @@ def business_args(call: "Call") -> tuple["Arg", ...]:
     前缀只认事实层自己的形状：前两个位置实参的原文正好是 `p` / `rt`。`p.off(...)` 这类方法调用
     不是 injected，原样返回。"""
     args = call.args
-    if (call.injected and len(args) >= 2 and args[0].keyword is None and args[1].keyword is None
+    if (call.injected and len(args) >= 2 and all(arg.keyword is None for arg in args[:2])
             and args[0].text == "p" and args[1].text == "rt"):
         return args[2:]
     return args
@@ -233,17 +233,20 @@ def _param_names(function: _Function | None) -> tuple[str, ...]:
     return tuple(a.arg for a in function.args.posonlyargs + function.args.args)
 
 
-def _product(parts: Sequence[Sequence[Item]]) -> list[str]:
+def _product(parts: Sequence[Sequence[str]]) -> list[str]:
     """各段取值的笛卡尔积：同一处实参经过的形参可能有多个调用处，一段对应多个结果。"""
     out = [""]
     for items in parts:
-        out = [head + item.text for head in out for item in items]
+        out = [head + item for head in out for item in items]
     return out
 
 
-def _values(source: "_Source", node: ast.expr, function: _Function | None,
-            backfill: bool = True) -> tuple[Item, ...] | None:
-    """一个表达式解析出的字符串。读不出返回 None，原文留给调用方；解析成空（`[]`）返回空元组。"""
+def _values(source: "_Source", node: ast.expr,
+            function: _Function | None) -> tuple[Item, ...] | None:
+    """一个表达式解析出的字符串。读不出返回 None，原文留给调用方；解析成空（`[]`）返回空元组。
+
+    `function` 是这处表达式所在的外层函数：形参回填只从本文件里调用它的地方取（见
+    `_Source.param_items`）；不在任何函数里时传 None。"""
     literal = _string_value(node)
     if literal is not None:
         return (Item(literal, node.lineno),)
@@ -260,10 +263,9 @@ def _values(source: "_Source", node: ast.expr, function: _Function | None,
         params = _param_names(function)
         if function is None or node.id not in params:
             return source.external(node.id)
-        if backfill:
-            filled = source.param_items(node.id, function)
-            if filled:
-                return filled
+        filled = source.param_items(node.id, function)
+        if filled:
+            return filled
         bound = source.bindings.get(params.index(node.id), ())
         return tuple(Item(text, node.lineno) for text in bound)
     if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
@@ -284,36 +286,45 @@ def _values(source: "_Source", node: ast.expr, function: _Function | None,
             and node.args and isinstance(node.args[0], ast.Constant)):
         return source.external(node.args[0].value)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _values(source, node.left, function, backfill)
-        right = _values(source, node.right, function, backfill)
+        left = _values(source, node.left, function)
+        right = _values(source, node.right, function)
         if left is None or right is None:
             return None
-        return tuple(Item(text, node.lineno) for text in _product((left, right)))
+        left_texts = [item.text for item in left]
+        right_texts = [item.text for item in right]
+        return tuple(Item(text, node.lineno) for text in _product((left_texts, right_texts)))
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and node.func.attr == "format" and isinstance(node.func.value, ast.Name)):
-        return _formatted(source, node, node.func.value.id, function, backfill)
+        return _formatted(source, node, node.func.value.id, function)
     return None
 
 
-def _formatted(source: "_Source", node: ast.Call, name: str, function: _Function | None,
-               backfill: bool) -> tuple[Item, ...] | None:
+def _formatted(source: "_Source", node: ast.Call, name: str,
+               function: _Function | None) -> tuple[Item, ...] | None:
     """`模板常量.format(包名)`：模板是模块级字符串常量、`{}` 按位置填进去才还原得出（沿用 #956 的写法）。"""
     template = source.last_string(name, (node.lineno, node.col_offset))
     if template is None or "{}" not in template.text:
         return None
-    rest, parts = template.text, []
+    # 中间只拼文本：行号在最后统一记到调用那一行，`Item` 在这里没有别的作用。
+    rest = template.text
+    parts: list[tuple[str, ...]] = []
     for argument in node.args:
-        values = _values(source, argument, function, backfill)
+        values = _values(source, argument, function)
         if values is None:
             return None
         head, slot, rest = rest.partition("{}")
         if not slot:
             return None
-        parts += [(Item(head, node.lineno),), values]
+        parts += [(head,), tuple(item.text for item in values)]
     if "{}" in rest:
         return None
-    parts.append((Item(rest, node.lineno),))
+    parts.append((rest,))
     return tuple(Item(text, node.lineno) for text in _product(parts))
+
+
+def _by_position(entry: tuple[_Position, ast.expr]) -> _Position:
+    """赋值点按 (行号, 列号) 排序：与整条 `(位置, 值)` 元组的先后一致。"""
+    return entry[0]
 
 
 class _Source:
@@ -334,7 +345,9 @@ class _Source:
                 self.assigns.setdefault(node.targets[0].id, []).append(
                     ((node.lineno, node.col_offset), node.value))
         for values in self.assigns.values():
-            values.sort(key=lambda entry: entry[0])
+            values.sort(
+                key=_by_position,   # pragma: no mutate 语义等价：位置 (行号, 列号) 两两不同，key=None 按 (位置, 值) 元组比较与按位置排序同序。
+            )
         for node in tree.body:
             self._module_constant(node)
         self._visit(tree, None)
@@ -355,8 +368,12 @@ class _Source:
             self.constants[name] = strings
         self.dicts.pop(name, None)
         if isinstance(node.value, ast.Dict):
-            keys, values = node.value.keys, node.value.values
-            self.dicts[name] = {key.value: value for key, value in zip(keys, values, strict=True)
+            pairs = zip(
+                node.value.keys,
+                node.value.values,
+                strict=True,   # pragma: no mutate 语义等价：`ast.Dict` 的 keys / values 恒等长，strict 三档结果相同。
+            )
+            self.dicts[name] = {key.value: value for key, value in pairs
                                 if isinstance(key, ast.Constant)}
 
     def _visit(self, node: ast.AST, function: _Function | None) -> None:
@@ -376,9 +393,9 @@ class _Source:
 
     def last_string(self, name: str, pos: _Position) -> Item | None:
         """这个名字在 `pos` 之前最后一次赋值；那次赋值不是字符串字面量时返回 None（不退回旧值）。"""
-        found = None
+        found = None   # pragma: no mutate 语义等价：空串不是 AST 节点，`_string_value` 对它同样返回 None。
         for where, value in self.assigns.get(name, ()):
-            if where < pos:
+            if where < pos:   # pragma: no mutate 语义等价：赋值节点与读取节点不会从同一位置开始，`<=` 与 `<` 取到的是同一批。
                 found = value
         if found is None:
             return None
@@ -398,7 +415,8 @@ class _Source:
             if not (isinstance(call.func, ast.Name) and call.func.id == function.name):
                 continue
             if index < len(call.args):
-                out += _values(self, call.args[index], None, backfill=False) or ()
+                # function=None：这层不再往回填形参，回填到调用处的实参为止（防绕圈）。
+                out += _values(self, call.args[index], None) or ()
         return tuple(out)
 
 
@@ -455,9 +473,13 @@ def _dict_entries(tree: ast.Module) -> tuple[DictEntry, ...]:
     for node in tree.body:
         if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)):
             continue
-        # ast.Dict 的 keys 与 values 恒等长；`{**other}` 的键是 None
-        for key, value in zip(node.value.keys, node.value.values, strict=True):
-            key_text = _string_value(key) if key is not None else None
+        # `{**other}` 的键是 None，`_string_value` 对它返回 None 后自然被跳过。
+        for key, value in zip(
+            node.value.keys,
+            node.value.values,
+            strict=True,   # pragma: no mutate 语义等价：`ast.Dict` 的 keys / values 恒等长，strict 三档结果相同。
+        ):
+            key_text = _string_value(key)
             value_text = _string_value(value)
             if key_text is not None and value_text is not None:
                 out.append(DictEntry(key_text, value_text, value.lineno))
@@ -542,14 +564,17 @@ def scan_dir(recipes_dir: str, families: Mapping[str, str] | None = None) -> dic
         if not os.path.isdir(model_dir):
             continue
         rel_dir = os.path.relpath(model_dir, recipes_dir).replace(os.sep, "/")
-        if families is not None and families.get(rel_dir.split("/", 1)[0].lower()) is None:
+        family = os.path.dirname(rel_dir).lower()   # `*/*` 只出两段，父目录就是家族名
+        if families is not None and families.get(family) is None:
             continue
         py = sorted(glob.glob(os.path.join(model_dir, "recipe*.py")))
         if py:
             for path in py:
                 rel = os.path.relpath(path, recipes_dir).replace(os.sep, "/")
-                with open(path, encoding="utf-8") as handle:
-                    out[rel] = scan_source(handle.read())
+                # 与本模块读 `.toml` 的 `tomllib.load()` 同口径按二进制打开，再 `decode()`（缺省 UTF-8）。
+                with open(path, "rb") as handle:
+                    raw = handle.read()
+                out[rel] = scan_source(raw.decode())
             continue
         for toml in sorted(glob.glob(os.path.join(model_dir, "*.toml"))):
             rel = os.path.relpath(toml, recipes_dir).replace(os.sep, "/")
@@ -557,9 +582,19 @@ def scan_dir(recipes_dir: str, families: Mapping[str, str] | None = None) -> dic
     return dict(sorted(out.items()))
 
 
+def _json(value: object) -> str:
+    """TOML 里的字符串 / 列表写成 Python 字面量：中文原样保留（`_s` 与 catalog 降级共用）。"""
+    return json.dumps(
+        value,
+        ensure_ascii=False,   # pragma: no mutate 语义等价：json 的 ensure_ascii 只按真假取用，None 与 False 写出相同字节。
+    )
+
+
 def _s(value: object) -> str:
-    """把 TOML 里的标量写成 Python 字面量（字符串走 json，数字/布尔原样）。"""
-    return json.dumps(value, ensure_ascii=False) if isinstance(value, str) else repr(value)
+    """把 TOML 里的标量写成 Python 字面量（字符串走 `_json`，数字 / 布尔原样）。"""
+    if isinstance(value, str):
+        return _json(value)
+    return repr(value)
 
 
 def _catalog_src(data: Mapping[str, Any]) -> str:
@@ -573,30 +608,54 @@ def _catalog_src(data: Mapping[str, Any]) -> str:
     from catalog.schema import NO_FACT_KINDS      # 延迟 import：只在投影时加载，import 本模块不被牵连
     lines: list[str] = []
 
+    def lower_args(op: Mapping[str, Any]) -> None:
+        """实参里的 `{ops = [...]}`（`close_named(..., reopen=…)` 的回调块）照样要读（#1371）。
+
+        重进页面的那几步本身就是入口事实（`am start` / `p.enter`）；不走进这块，这台机的入口速查
+        与词库会静默少几条。"""
+        args, kwargs = op.get("args"), op.get("kwargs")
+        values = (args if isinstance(args, list) else []) + (
+            list(kwargs.values()) if isinstance(kwargs, Mapping) else [])
+        for value in values:
+            if isinstance(value, Mapping) and "ops" in value:
+                lower(value["ops"])
+
     def lower(ops: Sequence[Any]) -> None:
         for op in ops:
             if not isinstance(op, Mapping):
                 continue
             kind = op.get("kind")
             if kind in ("off", "off_required"):
-                args = ""
+                parts: list[str] = []
                 if "only" in op:
-                    args += f"only={json.dumps(op['only'], ensure_ascii=False)}, "
+                    parts.append(f"only={_json(op['only'])}")
                 elif "only_code" in op:
-                    args += f"only={op['only_code']}(), "
+                    parts.append(f"only={op['only_code']}()")
                 if "keep" in op:
-                    args += f"keep={json.dumps(op['keep'], ensure_ascii=False)}, "
-                lines.append(f'p.off({args}page={_s(op["page"])})')
+                    parts.append(f"keep={_json(op['keep'])}")
+                parts.append(f"page={_s(op['page'])}")
+                lines.append(f"p.off({', '.join(parts)})")
             elif kind == "close_all":
                 lines.append(f'p.off(page={_s(op["page"])})')
             elif kind == "start":
-                extra = f", {_s(op['activity'])}" if "activity" in op else ""
-                lines.append(f'p.start({_s(op["pkg"])}{extra})')
+                # 拉起形状由 op 提供（#1478）：这里只交出事实层读得懂的调用形状。整条 `am start`
+                # 不再写进源码让入口速查正则回读——那会绕回「同一批脚本被两套词法解释」。
+                # 带 `action` + `pkg` 的是公开 Intent 入口，`-n` 那条靠位置实参认直达。
+                # 每个 op 仍占一行（投影的既有契约，词库的出处行号按它算）：只有 action 的那几种
+                # 写成 `p.start(action=…)`，没有包名就不构成入口。
+                facts: list[str] = []
+                if "pkg" in op:
+                    facts.append(_s(op["pkg"]))
+                    if "activity" in op:
+                        facts.append(_s(op["activity"]))
+                if "action" in op:
+                    facts.append(f"action={_s(op['action'])}")
+                lines.append(f"p.start({', '.join(facts)})")
             elif kind == "start_or_skip":
                 lines.append(f'start_or_skip(p, rt, {_s(op["pkg"])}, {_s(op["activity"])})')
             elif kind == "skip_unless_installed":
-                # `p.d.shell("pm path …")` 原样进事实层（不是 am start，不构成入口，只是不丢这条读）。
-                lines.append(f"p.d.shell({_s(op['command'])})")
+                # `p.shell("pm path …")` 原样进事实层（不是 am start，不构成入口，只是不丢这条读）。
+                lines.append(f"p.shell({_s(op['command'])})")
             elif kind in ("entry", "require_entry"):
                 lines.append(f"p.entry({_s(op['text'])})")
             elif kind == "enter":
@@ -608,21 +667,23 @@ def _catalog_src(data: Mapping[str, Any]) -> str:
                 lower(op.get("ops", []))
                 lower(op.get("else_ops", []))
             elif kind == "shell":
-                # 不经门面的拉起串（`am start …`）也是入口，不降级的话入口速查会漏掉这台机（#1263）。
-                lines.append(f"p.d.shell({_s(op['command'])})")
+                # 原样下发的拉起串（`am start …`）也是入口，不降级的话入口速查会漏掉这台机（沿用 #1263 的口径）。
+                lines.append(f"p.shell({_s(op['command'])})")
             elif kind == "gated":
                 for text in op.get("entries", []):
                     lines.append(f"maybe(p, rt, {_s(text)})")
                 lower(op.get("ops", []))
             elif kind == "scoped":
                 if "systemui_text" in op:
-                    lines.append(f"p.systemui_text = {op['systemui_text']!r}")
+                    lines.append(f"p.screen.systemui_text = {op['systemui_text']!r}")
                 lower(op.get("ops", []))
-            elif kind in ("if_find", "if_entry", "if_lib", "if_lib_any", "if_focus", "if_tap"):
+            elif kind in ("if_find", "if_entry", "if_lib", "if_lib_any", "if_focus", "if_tap",
+                          "if_var"):
                 # 带条件分支的 op：两支里的 off / 入口调用一样要读出来，否则词与入口会静默丢（#1263）。
                 if kind == "if_lib":
                     args = ", ".join(_s(a) for a in op.get("args", []))
                     lines.append(f"{op['name']}(p, rt, {args})" if args else f"{op['name']}(p, rt)")
+                    lower_args(op)
                 elif kind == "if_lib_any":
                     # 短路的每个助手都调得到：漏一个，入口归属就少一条（#1267）。
                     for call in op.get("calls", []):
@@ -631,12 +692,16 @@ def _catalog_src(data: Mapping[str, Any]) -> str:
                             lines.append(f"p.{call['method']}({args})")
                         else:
                             lines.append(f"{call['name']}(p, rt, {args})" if args else f"{call['name']}(p, rt)")
+                        lower_args(call)
                 lower(op.get("ops", []))
                 lower(op.get("else_ops", []))
-            elif kind in ("lib", "require_lib", "code", "return_lib"):
-                # 用数据里写得出的真实名字（不折回 close_named），归属才查得准（#1263）。
+            elif kind in ("lib", "require_lib", "code", "return_lib", "let"):
+                # 用数据里写得出的真实名字（不折回 close_named），归属才查得准（沿用 #1263）。`let` 点名的
+                # 实现写在 `lib` 上，`name` 是它绑定的段内名字（#1373）——绑定的名字不进事实层。
+                called = op["lib"] if kind == "let" else op["name"]
                 args = ", ".join(_s(a) for a in op.get("args", []))
-                lines.append(f"{op['name']}(p, rt, {args})" if args else f"{op['name']}(p, rt)")
+                lines.append(f"{called}(p, rt, {args})" if args else f"{called}(p, rt)")
+                lower_args(op)
             elif kind == "close_listed":
                 # 候选名单是「这一页要关掉这些名字」，按 `close_named(名单, 页)` 投影进事实层：
                 # 词库按 close 那一类读得出这些字面量（旧脚本里 `names` 是运行期变量，读不出，#1265）。
@@ -665,7 +730,7 @@ def library_sources() -> dict[str, tuple[str, str]]:
     """机型库数据可调用的实现：{名字: (归属模块, 源码)}。
 
     名字全局唯一，直接定位实现，不再按脚本 import 做归属解析（沿用 #1268）。实现按家族住在
-    `recipe_lib/<家族>.py` / `recipe_lib/shared.py`，`LIBRARY` 就是那 140 个数据可点名的名字
+    `recipe_lib/<家族>.py` / `recipe_lib/shared.py`，`LIBRARY` 就是那些数据可点名的名字
     （ADR-0040）；归属写函数真正的 `__module__`（`recipe_lib.shared` 等）。
     词库与入口速查拿它扫实现里的字面量。结果是进程内常量，缓存起来：`inspect.getsource` 很慢，
     一次全量回归会调上千次（#1307）。返回值按只读共享，调用方改了它这份缓存就脏了。
@@ -719,7 +784,8 @@ def library_hits(facts: Facts, sources: Mapping[str, tuple[str, str]]) -> Iterat
 def _walk_hits(current: Facts, caller: Facts, sources: Mapping[str, tuple[str, str]],
                seen: frozenset[str]) -> Iterator[ImplHit]:
     """先序深度优先：`current` 是这一层的事实，`caller` 始终是调用脚本（本地定义与常量都在它那儿）。"""
-    names = dict.fromkeys(call.name for call in current.calls if call.injected and call.module)
+    # 有归属模块的调用一定也是按名字写的（`_call_name()` 只有那两支给 module）。
+    names = dict.fromkeys(call.name for call in current.calls if call.module)
     if current is caller:
         names.update(caller.import_lines)   # 脚本 import 过的实现算用过；递归层只看实际调用
     for name in names:
@@ -731,14 +797,16 @@ def _walk_hits(current: Facts, caller: Facts, sources: Mapping[str, tuple[str, s
         module, source = entry
         calls = tuple(call for call in current.calls
                       if call.injected and call.module and call.name == name)
-        call_site = calls[0].line if calls else caller.import_lines.get(name)
-        if call_site is None:
-            continue
+        # 脚本这一层的名字来自调用点或导入行，后者没有调用点可记，只剩导入行。
+        if calls:
+            call_site = calls[0].line
+        else:
+            call_site = caller.import_lines[name]
         # 没有可回填的实参时传 None：空 mapping 在 `scan_source` 的缓存键里与 None 不是同一条，
         # 「实现 × 脚本」的组合会凭空多出一份缓存条目（沿用 #1321 的缓存口径）。
         impl = scan_source(source, _bindings(calls) or None, externals=caller.constants)
         yield ImplHit(name, module, impl, call_site)
-        yield from _walk_hits(impl, caller, sources, seen | {name})
+        yield from _walk_hits(impl, caller, sources, seen.union({name}))
 
 
 def _bindings(calls: Sequence[Call]) -> dict[int, tuple[str, ...]]:
@@ -777,7 +845,8 @@ def scan_catalog(data: Mapping[str, Any], exception_src: str | None = None) -> F
     import_lines = dict(base.import_lines)
     calls = []
     for call in base.calls:
-        if call.injected and call.name not in base.defines:
+        # 降级出的源码里没有 `def`，`base.defines` 恒为空；本地同名定义只可能来自例外函数，而它在这一步之后才并入。
+        if call.injected:
             module = modules.get(call.name)
             if module is not None:
                 imports.setdefault(call.name, module)
@@ -795,10 +864,12 @@ def scan_catalog_file(toml_path: str) -> Facts:
     with open(toml_path, "rb") as handle:
         data = tomllib.load(handle)
     companion = os.path.splitext(toml_path)[0] + ".py"
-    exception_src = None
+    exception_src = None   # pragma: no mutate 语义等价：空源码扫出的事实为空，合并结果与不合并相同。
     if os.path.isfile(companion):
-        with open(companion, encoding="utf-8") as handle:
-            exception_src = handle.read()
+        # 与 `scan_dir()` 同口径：二进制读再 `decode()`（缺省 UTF-8）。
+        with open(companion, "rb") as handle:
+            raw = handle.read()
+        exception_src = raw.decode()
     return scan_catalog(data, exception_src)
 
 

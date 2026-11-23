@@ -29,12 +29,12 @@ from fixtures import FakeRunner, fake_adb, phone_stub
 
 
 def channel_phone():
-    p = phone_stub("test", d=Mock())
+    p = phone_stub("test", reader=Mock())
     p.W, p.H = 1080, 1920
     p.conn.locked = Mock(return_value=False)
     p.screen.focus = Mock(return_value="com.android.settings/.Settings$ChannelNotificationSettingsActivity")
     p.confirm = Mock()
-    p.click = Mock()
+    p.click = p.screen.click = Mock()      # 到达决策经 apply() 落到观测基座
     p.screen.tree = Mock(return_value=ET.fromstring('''<hierarchy><node>
       <node text="营销" bounds="[100,80][600,180]"/>
       <node bounds="[0,300][1080,410]">
@@ -52,14 +52,15 @@ def snapshot(on=True, app_off=False):
 class ShellPipeTests(unittest.TestCase):
     """#205：管道末端提前退出（grep -m / head -n）→ dumpsys 收到 SIGPIPE → adbutils 判
     「shell output invalid」，chan-off 整段中断。末端必须把整条流读完。"""
+    DOMAIN = "connection"
 
     # 管道末端只要提前退出就会触发 SIGPIPE：grep -m N、head（-N 或 -n N）、sed 'Nq'
     EARLY_EXIT = re.compile(r"grep\s+-m\s*\d|\|\s*head\b|\|\s*sed\s+['\"]?\d+q")
 
     def dumpsys_commands(self):
         calls = []
-        p = phone_stub("test", d=Mock())
-        p.d.shell.side_effect = lambda cmd, *a, **k: (calls.append(cmd), types.SimpleNamespace(output=""))[1]
+        p = phone_stub("test", reader=Mock())
+        p.conn.reader.shell.side_effect = lambda cmd, *a, **k: (calls.append(cmd), types.SimpleNamespace(output=""))[1]
         p.focus()
         chan.notifications_denied(p, "com.example")
         return calls
@@ -71,13 +72,14 @@ class ShellPipeTests(unittest.TestCase):
 
     def test_focus_uses_first_match_when_the_whole_stream_is_read(self):
         # sed 把整条流读完后截断到前几行，输出仍可能有多条匹配；取第一行才是原来的语义
-        p = phone_stub("test", d=Mock())
-        p.d.shell.return_value = types.SimpleNamespace(output=(
+        p = phone_stub("test", reader=Mock())
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output=(
             "  mCurrentFocus=Window{1 u0 com.a/.A}\n  mCurrentFocus=Window{2 u0 com.b/.B}\n"))
         self.assertEqual(p.focus(), "com.a/.A")
 
 
 class ScreenshotTests(unittest.TestCase):
+    DOMAIN = "connection"
     def test_partial_bounds_do_not_read_outside_image(self):
         image = Image.new("RGB", (100, 100), "blue")
         self.assertIsNone(fast.Screen._pixel_on(image, 70, 70, 160, 120))
@@ -86,13 +88,14 @@ class ScreenshotTests(unittest.TestCase):
 
     def test_resolution_mismatch_is_unknown_not_off(self):
         p = channel_phone()
-        p.d.screenshot.return_value = Image.new("RGB", (540, 960))
+        p.conn.reader.screenshot.return_value = Image.new("RGB", (540, 960))
         root = ET.fromstring('<hierarchy><node resource-id="app:id/switch" clickable="true" bounds="[900,300][1040,400]"/></hierarchy>')
         self.assertEqual(p.switches(root), [])
 
 
 @patch.object(chan.time, "sleep")
 class ChannelTests(unittest.TestCase):
+    DOMAIN = "channel"
     def setUp(self):
         fake_adb(self)
 
@@ -133,46 +136,46 @@ class ChannelTests(unittest.TestCase):
     def test_dump_ids_with_trailing_spaces_are_one_channel(self, _sleep):
         # 系统回读里同一渠道可能带尾随空格；内部键必须一致，否则 load 后的 ID 查不到状态
         p = channel_phone()
-        p.d.shell.return_value.output = """PackagePreferences:
+        p.conn.reader.shell.return_value.output = """PackagePreferences:
       AppSettings: com.zongheng.reader importance=DEFAULT
         NotificationChannel{mId='flhd', mName=福利活动, mDescription=null, mImportance=0, mDeleted=false}
         NotificationChannel{mId='flhd ', mName=福利活动 , mDescription=null, mImportance=3, mDeleted=false}
     """
-        d, _ = chan.parse(p)
+        d, _ = chan.parse(p.conn.reader)
         self.assertEqual(list(d), [("com.zongheng.reader", "flhd")])
         self.assertEqual(d[("com.zongheng.reader", "flhd")][:2], ("福利活动", 3))
 
     def test_deleted_duplicate_does_not_override_live_channel(self, _sleep):
         p = channel_phone()
-        p.d.shell.return_value.output = """PackagePreferences:
+        p.conn.reader.shell.return_value.output = """PackagePreferences:
       AppSettings: com.example importance=DEFAULT
         NotificationChannel{mId='promo', mName=活动优惠, mDescription=null, mImportance=0, mDeleted=false}
         NotificationChannel{mId='promo ', mName=活动优惠 , mDescription=null, mImportance=3, mDeleted=true}
     """
-        d, _ = chan.parse(p)
+        d, _ = chan.parse(p.conn.reader)
         self.assertEqual(d[("com.example", "promo")], ("活动优惠", 0, False))
 
     def test_unspecified_importance_keeps_channel_on(self, _sleep):
         # 0 才是已屏蔽；-1000（未指定）名义上仍开着，合并时不能被已关的那条盖掉
         p = channel_phone()
-        p.d.shell.return_value.output = """PackagePreferences:
+        p.conn.reader.shell.return_value.output = """PackagePreferences:
       AppSettings: com.example importance=DEFAULT
         NotificationChannel{mId='promo', mName=营销, mDescription=null, mImportance=0, mDeleted=false}
         NotificationChannel{mId='promo ', mName=营销 , mDescription=null, mImportance=-1000, mDeleted=false}
     """
-        d, _ = chan.parse(p)
+        d, _ = chan.parse(p.conn.reader)
         self.assertEqual(d[("com.example", "promo")][1], -1000)
         self.assertEqual(chan.state(d, {}, "com.example", "promo"), "ON")
 
     def test_deleted_duplicate_does_not_mark_channel_locked(self, _sleep):
         p = channel_phone()
-        p.d.shell.return_value.output = """PackagePreferences:
+        p.conn.reader.shell.return_value.output = """PackagePreferences:
       AppSettings: com.example (10001) importance=DEFAULT fixedImportance=true
         NotificationChannel{mId='promo', mName=活动优惠, mDescription=null, mImportance=3, mDeleted=false}
         NotificationChannel{mId='promo ', mName=活动优惠 , mDescription=null, mImportance=3, mDeleted=true, mBlockableSystem=false}
     """
         locked = set()
-        chan.parse(p, locked)
+        chan.parse(p.conn.reader, locked)
         self.assertEqual(locked, set())
 
     def test_repeated_rows_do_not_count_as_still_on(self, _sleep):
@@ -236,9 +239,9 @@ class ChannelTests(unittest.TestCase):
 
     def test_notification_dump_failure_is_not_empty_success(self, _sleep):
         p = channel_phone()
-        p.d.shell.return_value.output = "Permission denied"
+        p.conn.reader.shell.return_value.output = "Permission denied"
         with self.assertRaisesRegex(RuntimeError, "读不到"):
-            chan.parse(p)
+            chan.parse(p.conn.reader)
 
     def test_app_master_switch_is_not_channel_switch(self, _sleep):
         p = channel_phone()
@@ -373,6 +376,7 @@ class ChannelTests(unittest.TestCase):
 
 
 class QuickappTests(unittest.TestCase):
+    DOMAIN = "packages"
     def setUp(self):
         fake_adb(self)
         self.directory = tempfile.TemporaryDirectory()
@@ -456,6 +460,7 @@ class QuickappTests(unittest.TestCase):
 
 
 class BackupTests(unittest.TestCase):
+    DOMAIN = "backup"
     def setUp(self):
         fake_adb(self)
 
@@ -492,16 +497,17 @@ class BackupTests(unittest.TestCase):
 class ExternalAdbServerTests(unittest.TestCase):
     """#293：复用了外部 adb server（Iriun 等），对方退出后整轮中断，
     而且 pm path 同样没输出，断连被报成「本机没有安装」，三段连报。"""
+    DOMAIN = "connection"
 
     def phone(self):
-        p = phone_stub("S", d=Mock())
+        p = phone_stub("S", reader=Mock())
         p.W, p.H = 1080, 1920
-        p.d.app_stop = Mock()
+        p.conn.reader.app_stop = Mock()
         return p
 
     def test_disconnected_device_is_not_reported_as_missing_app(self):
         p = self.phone()
-        p.d.shell.side_effect = [types.SimpleNamespace(exit_code=1, output=""),
+        p.conn.reader.shell.side_effect = [types.SimpleNamespace(exit_code=1, output=""),
                                  types.SimpleNamespace(exit_code=0, output="")]
         with patch.object(adb_link, "detached", return_value=True):
             with self.assertRaises(adb_link.DeviceLost) as raised:
@@ -512,7 +518,7 @@ class ExternalAdbServerTests(unittest.TestCase):
 
     def test_client_error_text_alone_identifies_the_disconnect(self):
         p = self.phone()
-        p.d.shell.side_effect = [types.SimpleNamespace(exit_code=0, output="error: device 'S' not found"),
+        p.conn.reader.shell.side_effect = [types.SimpleNamespace(exit_code=0, output="error: device 'S' not found"),
                                  types.SimpleNamespace(exit_code=0, output="")]
         with patch.object(adb_link, "detached") as detached:
             with self.assertRaises(adb_link.DeviceLost):
@@ -522,7 +528,7 @@ class ExternalAdbServerTests(unittest.TestCase):
     def test_missing_app_is_still_named_when_phone_is_there(self):
         """「本机没装」仍是这一句、仍带包名，但类型是跳过（#908）：段包装按跳过收尾，不再记未完成。"""
         p = self.phone()
-        p.d.shell.side_effect = [types.SimpleNamespace(exit_code=0, output="No activities found to run, monkey aborted."),
+        p.conn.reader.shell.side_effect = [types.SimpleNamespace(exit_code=0, output="No activities found to run, monkey aborted."),
                                  types.SimpleNamespace(exit_code=0, output="")]
         with patch.object(adb_link, "detached", return_value=False):
             with self.assertRaisesRegex(recipe_kit.MissingPackage, "本机没有安装 com.heytap.yoli"):
@@ -549,7 +555,7 @@ class ExternalAdbServerTests(unittest.TestCase):
 
     def test_lost_screen_library_error_marks_the_run_lost(self):
         p = self.phone()
-        p.d.dump_hierarchy.side_effect = RuntimeError("HTTPConnectionPool(host='127.0.0.1', port=5037): Max retries exceeded")
+        p.conn.reader.dump_hierarchy.side_effect = RuntimeError("HTTPConnectionPool(host='127.0.0.1', port=5037): Max retries exceeded")
         with self.assertRaises(RuntimeError):
             p.tree()
         self.assertTrue(p.lost)                                # 后面的段据此快速跳过
@@ -562,17 +568,15 @@ class ExternalAdbServerTests(unittest.TestCase):
             with self.assertRaises(adb_link.DeviceLost) as raised:
                 step()
             self.assertEqual(str(raised.exception), adb_link.REPEAT)   # 后面的段只报一句
-        p.d.shell.assert_not_called()
-        p.d.dump_hierarchy.assert_not_called()
-        p.d.window_size.assert_not_called()
-        p.d.app_stop.assert_not_called()
-
-
-
+        p.conn.reader.shell.assert_not_called()
+        p.conn.reader.dump_hierarchy.assert_not_called()
+        p.conn.reader.window_size.assert_not_called()
+        p.conn.reader.app_stop.assert_not_called()
 
 
 class PackageListTests(unittest.TestCase):
     """#192：HyperOS 4 上 `pm list packages` 任何参数都无输出且 exit 0；要回退 `cmd package list`。"""
+    DOMAIN = "connection"
 
     def setUp(self):
         fake_adb(self)
@@ -585,6 +589,34 @@ class PackageListTests(unittest.TestCase):
         with patch.object(run, "sh", return_value="package:com.example") as shell:
             self.assertEqual(run.pkg_list("test", "--user 0 -s"), "package:com.example")
         self.assertEqual([c.args[1] for c in shell.call_args_list], ["pm list packages --user 0 -s"])
+
+    def test_package_list_error_text_is_kept_for_troubleshooting(self):
+        def shell(_s, cmd):
+            return "Error: Shell does not have permission to access user 666" if cmd.startswith("pm list") else ""
+        with patch.object(run, "sh", side_effect=shell):
+            self.assertIn("does not have permission", run.pkg_list("test", "--user 0 -d"))
+
+    def test_manually_disabled_quickapp_is_closed_via_cmd_package(self):
+        # 装机判定走批量清单（pm list → cmd package 兜底），不再逐包 pm path
+        with patch.object(run, "quickapp_switch", return_value=None), \
+             patch.object(run, "suspended", return_value=False), \
+             patch.object(run, "sh", side_effect=lambda _s, c: "package:com.miui.hybrid" if c.startswith("cmd package") else ""):
+            entries = run.quickapps("test-device")
+        self.assertTrue(entries[0]["closed"])
+
+    def test_not_disabled_quickapp_stays_open(self):
+        with patch.object(run, "installed", side_effect=lambda _s, pkg: pkg == "com.miui.hybrid"), \
+             patch.object(run, "quickapp_switch", return_value=None), \
+             patch.object(run, "suspended", return_value=False), \
+             patch.object(run, "sh", return_value=""):
+            entries = run.quickapps("test-device")
+        self.assertFalse(entries[0]["closed"])
+
+
+class PackageListBackupTests(unittest.TestCase):
+    DOMAIN = "backup"
+    def setUp(self):
+        fake_adb(self)
 
     def test_backup_writes_package_lists_when_pm_list_is_silent(self):
         def shell(_s, cmd):
@@ -630,31 +662,10 @@ class PackageListTests(unittest.TestCase):
             self.assertEqual(Path(directory, "sys.txt").read_text(encoding="utf-8"), "package:com.system")
             self.assertEqual(Path(directory, "user.txt").read_text(encoding="utf-8"), "")
 
-    def test_package_list_error_text_is_kept_for_troubleshooting(self):
-        def shell(_s, cmd):
-            return "Error: Shell does not have permission to access user 666" if cmd.startswith("pm list") else ""
-        with patch.object(run, "sh", side_effect=shell):
-            self.assertIn("does not have permission", run.pkg_list("test", "--user 0 -d"))
-
-    def test_manually_disabled_quickapp_is_closed_via_cmd_package(self):
-        # 装机判定走批量清单（pm list → cmd package 兜底），不再逐包 pm path
-        with patch.object(run, "quickapp_switch", return_value=None), \
-             patch.object(run, "suspended", return_value=False), \
-             patch.object(run, "sh", side_effect=lambda _s, c: "package:com.miui.hybrid" if c.startswith("cmd package") else ""):
-            entries = run.quickapps("test-device")
-        self.assertTrue(entries[0]["closed"])
-
-    def test_not_disabled_quickapp_stays_open(self):
-        with patch.object(run, "installed", side_effect=lambda _s, pkg: pkg == "com.miui.hybrid"), \
-             patch.object(run, "quickapp_switch", return_value=None), \
-             patch.object(run, "suspended", return_value=False), \
-             patch.object(run, "sh", return_value=""):
-            entries = run.quickapps("test-device")
-        self.assertFalse(entries[0]["closed"])
-
 
 class QuickappKeepTests(unittest.TestCase):
     """Issue #335：快应用平台承载负一屏快递详情页，quickapp off 必须保留它。"""
+    DOMAIN = "packages"
     PKGS = ("com.nearme.instant.platform", "com.oppo.instant.local.service", "com.nearme.instant.card")
     HAP = "com.nearme.instant.platform/.dispatch.activity.HapDispatcherActivity"
 
@@ -725,6 +736,7 @@ class QuickappKeepTests(unittest.TestCase):
 
 
 class DesktopTests(unittest.TestCase):
+    DOMAIN = "desktop"
     def test_gui_smoke_output_works_with_non_utf8_console(self):
         buffer = io.BytesIO()
         stream = io.TextIOWrapper(buffer, encoding="ascii", newline="\n")
@@ -756,6 +768,7 @@ class DesktopTests(unittest.TestCase):
 class RepeatedChannelNameTests(unittest.TestCase):
     """#287：华为 HarmonyOS 4 的应用通知页把分组名写在列表里，和渠道名同名。
     inline_switch 以前看到两处同名就放弃，其实只有一处带开关。"""
+    DOMAIN = "channel"
 
     APP = "com.android.settings/.Settings$AppNotificationSettingsActivity"
 
@@ -776,7 +789,7 @@ class RepeatedChannelNameTests(unittest.TestCase):
     </node></hierarchy>'''
 
     def phone(self, page):
-        p = phone_stub("test", d=Mock())
+        p = phone_stub("test", reader=Mock())
         p.W, p.H = 1080, 2340
         p.screen.focus = Mock(return_value=self.APP)
         p.screen.tree = Mock(return_value=ET.fromstring(page))
@@ -855,6 +868,7 @@ class AdPackagesHarness:
 class AdPackagesTests(AdPackagesHarness, unittest.TestCase):
     """#367：AD_PKGS 以 ro.product.brand 原值取键，POCO 取不到小米家族的广告包。
     客户端「挂起广告组件」读的是 status-json 的 ads，所以 check 与 status-json 两个入口都守。"""
+    DOMAIN = "packages"
 
     def test_check_lists_xiaomi_ad_package_for_poco_brand(self):
         self.assertIn("广告包 com.miui.systemAdSolution：未挂起", self.check_output("POCO"))
@@ -880,6 +894,7 @@ class AdPackagesTests(AdPackagesHarness, unittest.TestCase):
 class GlobalMsaTests(AdPackagesHarness, unittest.TestCase):
     """海外版 HyperOS（Redmi Note 13 23124RA7EO，OS2.0.213.0.VNHRUXM 俄区实测）的 msa 包名是
     com.miui.msa.global，国行包名不存在：check 与 status-json 要认出它，国行不多出一行。"""
+    DOMAIN = "packages"
 
     INFO = dict(AdPackagesHarness.INFO, model="23124RA7EO", name="Redmi Note 13")
     INSTALLED = ("com.miui.msa.global",)
@@ -902,6 +917,7 @@ class GlobalMsaTests(AdPackagesHarness, unittest.TestCase):
 class OppoSecondAdPackageTests(AdPackagesHarness, unittest.TestCase):
     """「没装就不提」只针对 msa 的两个地区包名；OPPO 族的第二项不是一个组件的别名，
     没装时仍要报「未安装」。"""
+    DOMAIN = "packages"
 
     INFO = dict(AdPackagesHarness.INFO, model="PKT110", name="OPPO Find X8s")
     INSTALLED = ("com.opos.ads",)

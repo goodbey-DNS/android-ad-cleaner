@@ -54,9 +54,11 @@ class Redmi24094RAD4CRecipeTests(unittest.TestCase):
 
     def test_script_keeps_store_mode_updates_and_functional_browser_entries(self):
         self.assertNotIn("极简模式", self.source)
-        self.assertEqual(segment_of(self.data, "应用商店").get("code"), "step_store")
-        # 商店的「不碰父开关」名单住在例外函数里，逐字保留。
-        self.assertIn('keep=["推送消息", "应用更新"]', self.source)
+        store = segment_of(self.data, "应用商店")
+        self.assertNotIn("code", store, "商店段是页面树数据，不再交给本机例外函数")
+        # 商店的「不碰父开关」名单逐字保留。
+        notice = [op for op in walk(store["ops"]) if op.get("page") == "商店·通知设置"]
+        self.assertEqual([op.get("keep") for op in notice], [["推送消息", "应用更新"]])
         theme = [op for op in walk(ops_of(self.data, "主题")) if op.get("kind") == "off_required"]
         self.assertEqual([op.get("keep") for op in theme], [["自动更新"]])
         browser = [op for op in walk(ops_of(self.data, "浏览器")) if op.get("kind") == "off"]
@@ -93,7 +95,7 @@ class Redmi24094RAD4CRecipeTests(unittest.TestCase):
         ]
         scope, _ = load_recipe(p, self.path)
         scope["close_with_plain_tap"](["资源推荐", "热榜推荐"], "下载管理·信息流")
-        self.assertEqual(p.d.shell.call_count, 2)
+        self.assertEqual(p.shell.call_count, 2)
         self.assertEqual(p.confirm.call_count, 2)
         self.assertEqual(p.changed, [("下载管理·信息流", "资源推荐"),
                                      ("下载管理·信息流", "热榜推荐")])
@@ -108,7 +110,7 @@ class Redmi24094RAD4CRecipeTests(unittest.TestCase):
         ]
         scope, _ = load_recipe(p, self.path)
         scope["close_with_plain_tap"](["资源推荐", "热榜推荐"], "浏览器·隐私和安全")
-        self.assertEqual(p.d.shell.call_count, 1)
+        self.assertEqual(p.shell.call_count, 1)
         self.assertEqual(p.changed, [("浏览器·隐私和安全", "热榜推荐")])
 
     def test_plain_tap_fallback_aborts_when_target_missing(self):
@@ -117,7 +119,7 @@ class Redmi24094RAD4CRecipeTests(unittest.TestCase):
         scope, _ = load_recipe(p, self.path)
         with self.assertRaisesRegex(RuntimeError, "未识别全部目标"):
             scope["close_with_plain_tap"](["资源推荐", "热榜推荐"], "下载管理·信息流")
-        p.d.shell.assert_not_called()
+        p.shell.assert_not_called()
 
     def test_note_14_pro_remains_a_separate_recipe(self):
         path, reference = run.recipe_for("24090RA29C", "Redmi")

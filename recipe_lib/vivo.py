@@ -5,15 +5,18 @@
 """
 
 import time
+import adb_link
 from wait import until
-from recipe_lib.shared import _style, browser_settings, maybe, read_switches, tap
+from recipe_runtime import SkipStep
+from recipe_lib.shared import _style, browser_settings, maybe, opened, read_switches, tap
+from phone.errors import ScreenLocked
 from row import bounds, icon_hit
 
-__all__ = ('browser_recommendations', 'browser_settings_vivo', 'by_desc', 'close_named_vivo', 'confirm2', 'dialog_open', 'global_search_ads', 'hiboard_panel_v2547a', 'hiboard_panel', 'i_manager_ads', 'lock_screen_magazine', 'off', 'off_one', 'off_unnamed', 'result_xy', 'row_switch', 'rows', 'search_setting', 'setting_search', 'settings_home', 'store_personalization', 'switch_off', 'system_ads_branch', 'system_ads_chain', 'tap_row', 'weather_service')
+__all__ = ('browser_recommendations', 'browser_settings_vivo', 'by_desc', 'close_named_vivo', 'confirm2', 'dialog_open', 'global_search_ads', 'global_search_entry', 'hiboard_panel_v2547a', 'hiboard_panel', 'i_manager_ads', 'lock_screen_magazine', 'off', 'off_one', 'off_unnamed', 'result_xy', 'row_switch', 'rows', 'search_setting', 'setting_search', 'settings_home', 'store_personalization', 'store_settings_direct', 'switch_off', 'system_ads_branch', 'system_ads_chain', 'tap_row', 'weather_service')
 
 # ---------- 词汇 ----------
 def settings_home(p, rt):
-    p.d.shell("am start -f 0x10008000 -a android.settings.SETTINGS"); time.sleep(1.2)
+    p.shell("am start -f 0x10008000 -a android.settings.SETTINGS"); time.sleep(1.2)
 
 def browser_settings_vivo(p, rt, tries=2):
     """右上「菜单 → 设置」，点完要认出设置页（沿用 #753 的做法）。
@@ -29,7 +32,7 @@ def browser_settings_vivo(p, rt, tries=2):
         return bool(at) and at[1] < p.H * 0.25
 
     for _ in range(tries):
-        if not p.d(resourceId="com.vivo.browser:id/menu_btn").click_exists(timeout=3):
+        if not p.tap_id_if_present("com.vivo.browser:id/menu_btn", timeout=3):
             return False                        # 本机没有这个按钮：交给调用方跳过本段
         p.await_page(1.6)                       # 菜单是弹层，画出来的那一帧才有「设置」
         xy = until(lambda: p.find("设置", exact=True, edge_ok="tab"), timeout=3.0, poll=0.3,
@@ -228,7 +231,7 @@ def search_setting(p, rt, kw, pick=True):
     引擎的 p.setting 依赖 focused 输入框，在 vivo 上时而等不到（会抛异常），这里直接按 resourceId
     取输入框。点完还要确认焦点窗口真的变了，否则返回 False —— 宁可报错，也不要装作进去了。"""
     p.miss = 0
-    p.d.shell("am start -f 0x10008000 -a android.settings.SETTINGS")
+    p.shell("am start -f 0x10008000 -a android.settings.SETTINGS")
     for _ in range(24):
         if p.find("搜索设置项"):
             break
@@ -236,7 +239,7 @@ def search_setting(p, rt, kw, pick=True):
     if not p.tap("搜索设置项", scrolls=0, wait=0.6):
         print("  ✗ 设置首页没找到搜索框"); return False
     try:
-        p.d(resourceId="com.android.settings:id/vigour_search_edit").set_text(kw)
+        p.set_text("com.android.settings:id/vigour_search_edit", kw)
     except Exception as e:
         print(f"  ✗ 搜索框输入失败：{e}"); return False
     xy = None
@@ -266,14 +269,14 @@ def hiboard_panel(p, rt):
     # 此页面未导出，不能 am start；两次 HOME 回默认桌面，再按真机路径滑入。
     for _ in range(2):
         signature = p.sig()
-        p.d.shell("input keyevent HOME")
+        p.shell("input keyevent HOME")
         p.settle(signature, 1.0)
     # HOME 会恢复上次停留的负一屏；已在 HiBoard 时不必再当普通桌面横滑。
     home = p.focus()
     if home != "HiBoard":
         rt.require(home.startswith("com.bbk.launcher2/"), "未回到系统桌面，停止负一屏段")
         signature = p.sig()
-        p.d.shell(f"input swipe {p.W // 10} {p.H // 2} {p.W * 9 // 10} {p.H // 2} 300")
+        p.shell(f"input swipe {p.W // 10} {p.H // 2} {p.W * 9 // 10} {p.H // 2} 300")
         p.settle(signature, 1.5)
     rt.require(p.focus() == "HiBoard" and p.find("添加组件", exact=True),
                  "未进入负一屏（可能未启用），停止本段")
@@ -288,9 +291,9 @@ def hiboard_panel_v2547a(p, rt):
     不能用「屏上有『热点资讯』」来判断：负一屏主页上本来就有资讯卡片，会误判成面板。"""
     if "AppletSettingActivity" in p.focus():
         return True
-    p.d.shell("input keyevent HOME"); rt.clock.sleep(1.0)
+    p.shell("input keyevent HOME"); rt.clock.sleep(1.0)
     for _ in range(3):
-        p.d.shell(f"input swipe {p.W//10} {p.H//2} {p.W*9//10} {p.H//2} 250")
+        p.shell(f"input swipe {p.W//10} {p.H//2} {p.W*9//10} {p.H//2} 250")
         rt.clock.sleep(1.5)
         if p.find("添加组件") or p.find("小V建议"):
             break
@@ -402,6 +405,23 @@ def setting_search(p, rt, keyword, result):
     except Exception as e:
         print(f"  设置搜索「{keyword}」没走通：{e}")
         return False
+
+def store_settings_direct(p, rt, pkg, activity, marker):
+    """商店设置页能按 Activity 直达就直达：落点对得上返回真（V2303A / V2547DA，Android 17）。
+
+    「我的」页没有能读到的齿轮入口，只能直达（沿用 #220）。直达抛错时不中断，由调用方按
+    「我的 → 设置」回退；断线 / 锁屏 / 约定跳过照常上抛——三者都是 RuntimeError 的子类，不单列出来
+    会被当成「这一页打不开」，掉线在回退路径上再空跑一次、跳过也会说成失败（沿用 #293 / #908）。
+    包名与页面名由数据传进来：`tool/entries.py` 按调用点的这两个实参认入口速查。"""
+    try:
+        p.start(pkg, activity)
+    # 沿用 #293：断线 / 锁屏 / 跳过都不算「这页打不开」，与同家族 `global_search_entry` 一致。
+    except (adb_link.DeviceLost, SkipStep, ScreenLocked):
+        raise
+    except RuntimeError as e:
+        print(f"  · 直达商店设置页失败（{e}），改走「我的 → 设置」")
+        return False
+    return marker in p.focus()
 
 def store_personalization(p, rt):
     """两行标题会随状态变化；逐行点，处理确认框后用稳定标题回读。"""
@@ -611,7 +631,7 @@ def browser_recommendations(p, rt):
 
 def i_manager_ads(p, rt):
     """i管家「关于 → 个性化设置」，直达 MainSettings 页。"""
-    p.d.shell("am start -f 0x10008000 -n com.iqoo.secure/.MainSettings")
+    p.shell("am start -f 0x10008000 -n com.iqoo.secure/.MainSettings")
     rt.clock.sleep(1.0)
     if maybe(p, rt, "关于") and maybe(p, rt, "个性化设置"):
         p.off(only=["应用个性化推荐", "清理个性化推荐"], page="i管家·个性化设置")
@@ -624,17 +644,32 @@ def lock_screen_magazine(p, rt):
         p.off(only=["阅图锁屏", "锁屏横滑进入阅图"], page="阅图锁屏")
 
 def system_ads_branch(p, rt):
-    """系统设置里的「广告与隐私」：首屏入口读作「安全」或「安全与隐私」两种都认。"""
+    """系统设置里的「广告与隐私」：首屏入口读作「安全」或「安全与隐私」两种都认。
+
+    返回「走到了广告与隐私页并关过一轮」：调用方据此决定还要不要再走设置搜索（V2545A）。
+    与关掉几项无关——出厂就全关时也是走通了这条路，不该再搜一次。"""
     settings_home(p, rt)
     if maybe(p, rt, "安全") or maybe(p, rt, "安全与隐私"):
         if maybe(p, rt, "更多安全设置") and maybe(p, rt, "广告与隐私"):
             p.off(only=["个性化广告", "个性化推荐", "智能推荐服务"], page="系统·广告与隐私")
+            return True
+    return False
 
 def system_ads_chain(p, rt):
     """系统设置里的「广告与隐私」：一路串联认「安全 → 更多安全设置 → 广告与隐私」。"""
     settings_home(p, rt)
     if maybe(p, rt, "安全") and maybe(p, rt, "更多安全设置") and maybe(p, rt, "广告与隐私"):
         p.off(only=["个性化广告", "个性化推荐", "智能推荐服务"], page="系统·广告与隐私")
+
+def global_search_entry(p, rt, pkg=None, activity=None, expect=None):
+    """全局搜索的设置页：给了包名与页面名就先试直达（Android 17 变体），不通再走设置菜单。
+
+    到了返回真；两级都认不出返回假，由调用方收段。直达绕过「系统管理与升级」这一层，
+    那层在 Android 17 上换过名字（沿用 #220 的记录）。"""
+    if pkg and opened(p, rt, lambda: p.start(pkg, activity, expect=expect, budget=2)):
+        return True
+    settings_home(p, rt)
+    return bool(maybe(p, rt, "系统管理与升级") and maybe(p, rt, "全局搜索"))
 
 def global_search_ads(p, rt):
     """系统管理与升级 → 全局搜索 的三个子页；历史记录与应用建议保留。"""
@@ -649,7 +684,7 @@ def global_search_ads(p, rt):
 
 def weather_service(p, rt):
     """天气设置页只关「天气服务」（天气相关热点资讯通知），预警类三个开关同页保留。"""
-    p.d.shell("am start -f 0x10008000 -n com.vivo.weather/.WeatherSettings")
+    p.shell("am start -f 0x10008000 -n com.vivo.weather/.WeatherSettings")
     rt.clock.sleep(1.0)
     p.off(only=["天气服务"], keep=["气象预警", "异常天气", "地震预警"], page="天气·设置")
     p.back(1)

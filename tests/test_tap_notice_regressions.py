@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import xml.etree.ElementTree as ET
 
 from fixtures import FakeProc, FakeRunner, job_stub
+from gui import adb as adb_mod
 from gui import app
 from gui.bundle_data import bundle_data
 
@@ -24,7 +25,7 @@ from fixtures import phone_stub
 
 
 def phone(xml, w=1080, h=2340):
-    p = phone_stub("test", d=Mock())
+    p = phone_stub("test", reader=Mock())
     p.W, p.H = w, h
     p.screen.click = Mock()
     p.screen.tree = Mock(return_value=ET.fromstring(xml))
@@ -48,6 +49,7 @@ STORE = '''<hierarchy><node bounds="[0,0][1080,2340]">
 
 
 class TapTests(unittest.TestCase):
+    DOMAIN = "switch"
     def test_exact_title_wins_over_partial_text(self):
         p = phone(STORE)
         self.assertEqual(p.find("隐私", nav=True), (380, 850))
@@ -69,6 +71,7 @@ class TapTests(unittest.TestCase):
 
 
 class ConfirmTests(unittest.TestCase):
+    DOMAIN = "switch"
     def test_label_in_child_text_view(self):
         # PR #239：vivo / iQOO 弹窗的按钮文字在 Button 下级 TextView（vbutton_title）
         p = phone('''<hierarchy><node bounds="[0,0][1080,2340]">
@@ -99,16 +102,17 @@ class ConfirmTests(unittest.TestCase):
 
 
 class FocusTests(unittest.TestCase):
+    DOMAIN = "device_state"
     def test_null_focus_falls_back_to_focused_app(self):
         # 华为 LIO-AN00 HarmonyOS 4.2、vivo V2111A：页面在，却报「停在 未知页面」
-        p = phone_stub("test", d=Mock())
-        p.d.shell.return_value = types.SimpleNamespace(output=(
+        p = phone_stub("test", reader=Mock())
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output=(
             "  mCurrentFocus=null\n  mFocusedApp=ActivityRecord{5e1 u0 com.android.settings/.Settings$AppNotificationSettingsActivity t88}\n"))
         self.assertEqual(p.focus(), "com.android.settings/.Settings$AppNotificationSettingsActivity")
 
     def test_resumed_activity_line_variants(self):
-        p = phone_stub("test", d=Mock())
-        p.d.shell.side_effect = [types.SimpleNamespace(output="  mCurrentFocus=null\n"),
+        p = phone_stub("test", reader=Mock())
+        p.conn.reader.shell.side_effect = [types.SimpleNamespace(output="  mCurrentFocus=null\n"),
                                  types.SimpleNamespace(output="    mResumedActivity: ActivityRecord{9a u0 com.vivo.x/.MainActivity t3}\n")]
         self.assertEqual(p.focus(), "com.vivo.x/.MainActivity")
 
@@ -125,10 +129,12 @@ Restored without uid:
 
 
 class NotificationTests(unittest.TestCase):
+    DOMAIN = "channel"
     def test_android9_dump_is_read(self):
         # #258 海信 HLTE217T / Android 9：以前「读不到通知渠道状态」
-        p = types.SimpleNamespace(d=types.SimpleNamespace(shell=lambda *a, **k: types.SimpleNamespace(output=ANDROID9)))
-        d, app_off = chan.parse(p)
+        p = types.SimpleNamespace(conn=types.SimpleNamespace(
+            reader=types.SimpleNamespace(shell=lambda *a, **k: types.SimpleNamespace(output=ANDROID9))))
+        d, app_off = chan.parse(p.conn.reader)
         self.assertEqual(d[("com.hisense.promo", "deals")], ("优惠活动", 3, False))
         self.assertTrue(app_off["com.blocked"])
 
@@ -148,9 +154,9 @@ class NotificationTests(unittest.TestCase):
     def test_app_level_permission_off_is_not_a_failure(self):
         # 三星 SM-S9080：9 个渠道页上开关显示关、渠道记录仍开（应用通知整体关了）
         p = Mock()
-        p.d.shell.return_value = types.SimpleNamespace(output="      android.permission.POST_NOTIFICATIONS: granted=false, flags=[ USER_SET ]\n")
+        p.shell.return_value = "      android.permission.POST_NOTIFICATIONS: granted=false, flags=[ USER_SET ]\n"
         self.assertTrue(chan.notifications_denied(p, "com.samsung.x"))
-        p.d.shell.return_value = types.SimpleNamespace(output="      android.permission.POST_NOTIFICATIONS: granted=true, flags=[ ]\n")
+        p.shell.return_value = "      android.permission.POST_NOTIFICATIONS: granted=true, flags=[ ]\n"
         self.assertFalse(chan.notifications_denied(p, "com.samsung.x"))
 
     def test_denied_channels_are_left_out_of_the_failure_count(self):
@@ -168,6 +174,8 @@ class NotificationTests(unittest.TestCase):
 
 
 class GuiTests(unittest.TestCase):
+    DOMAIN = "desktop"
+
     @classmethod
     def setUpClass(cls):
         cls.app = app
@@ -192,14 +200,14 @@ class GuiTests(unittest.TestCase):
                     raise OSError("timed out")
                 return Reply(body)
             with patch.object(api, "adb_sources", return_value=sources), \
-                 patch.object(self.app.urllib.request, "urlopen", side_effect=opener), \
-                 patch.object(self.app.zipfile, "ZipFile", side_effect=self.app.zipfile.BadZipFile("not a zip")):
+                 patch.object(adb_mod.urllib.request, "urlopen", side_effect=opener), \
+                 patch.object(adb_mod.zipfile, "ZipFile", side_effect=adb_mod.zipfile.BadZipFile("not a zip")):
                 api._download()
             self.assertEqual(urls, ["https://g/x.zip", "https://t/x.zip"])
             self.assertIn("not a zip", api.dl["msg"])           # 校验过了，走到解压
             self.assertFalse(Path(d, "fresh", "platform-tools.zip").exists())
             with patch.object(api, "adb_sources", return_value=[("腾讯云镜像", "https://t/x.zip", "0" * 64)]), \
-                 patch.object(self.app.urllib.request, "urlopen", return_value=Reply(body)):
+                 patch.object(adb_mod.urllib.request, "urlopen", return_value=Reply(body)):
                 api._download()
             self.assertIn("校验不对", api.dl["msg"])
 
@@ -255,9 +263,9 @@ class GuiTests(unittest.TestCase):
         self.assertIn(str(ROOT / "gui/web/chime.wav"), [src for src, _ in bundle_data(ROOT)])
 
 
-
 class VivoSlowTransitionTests(unittest.TestCase):
     """0.2.7 的 vivo 报告里 212 次「点这一行后页面没变；标题顶部」：转场慢，settle 等不到，其实渠道页已经打开。"""
+    DOMAIN = "channel"
     APP = """<hierarchy><node package="com.vivo.systemuiplugin" bounds="[0,0][1080,2340]">
       <node resource-id="com.vivo.systemuiplugin:id/originui_vtoolbar_normal_title" text="淘宝" bounds="[100,120][600,200]"/>
       <node clickable="true" bounds="[0,500][1080,610]">
@@ -280,11 +288,12 @@ class VivoSlowTransitionTests(unittest.TestCase):
     </node></hierarchy>"""
 
     def phone(self, pages, settled):
-        p = phone_stub("test", d=Mock())
+        p = phone_stub("test", reader=Mock())
         p.W, p.H = 1080, 2340
         p.locked = Mock(return_value=False)
         p.screen.focus = Mock(return_value="com.vivo.systemuiplugin/com.vivo.systemui.statusbar.notification.settings.channels.NotificationSettingsActivity")
         p.click, p.confirm, p.screen.sig = Mock(), Mock(), Mock(return_value="")
+        p.screen.click = p.click
         p.screen.settle = Mock(return_value=settled)
         p.scroll_more = Mock(return_value=False)
         queue = [ET.fromstring(x) for x in pages]

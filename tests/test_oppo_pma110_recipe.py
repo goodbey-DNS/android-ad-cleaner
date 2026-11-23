@@ -12,24 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tool"))
 sys.path.insert(0, str(ROOT / "tests"))
 import fixtures
+from fixtures import shell_result
 import run
-from fixtures import load_recipe
+from recipe_case import load, radios
 
 RECIPE = ROOT / "recipes/oppo/PMA110/PMA110.toml"
-
-
-def load(phone, only=None):
-    scope, _ = load_recipe(phone, RECIPE, only)
-    return scope
-
-
-def radios(show=True):
-    return ET.fromstring(f'''<hierarchy><node text="不显示轮播推荐" clickable="true"/>
-      <node><node text="显示轮播推荐"/><node class="android.widget.RadioButton"
-        checkable="true" checked="{str(show).lower()}" enabled="true" bounds="[20,30][60,70]"/></node>
-      <node><node text="不显示轮播推荐"/><node class="android.widget.RadioButton"
-        checkable="true" checked="{str(not show).lower()}" enabled="true" bounds="[200,300][240,340]"/></node>
-    </hierarchy>''')
 
 
 class Pma110RecipeTests(unittest.TestCase):
@@ -37,7 +24,7 @@ class Pma110RecipeTests(unittest.TestCase):
         self.p = Mock()
         self.p.changed = []
         self.p.locked.return_value = False
-        self.scope = load(self.p)
+        self.scope = load(self.p, RECIPE)
         # 用例往 scope[name] 放桩；统一接缝把它们接到库模块与解释器。
         self.read_switches = self.scope["read_switches"] = Mock()
         self.scope["read_switches"] = self.read_switches
@@ -98,7 +85,7 @@ class Pma110RecipeTests(unittest.TestCase):
         reopen.assert_called_once_with()
 
     def test_denied_activity_never_falls_through_to_clicks(self):
-        self.p.d.shell.return_value = SimpleNamespace(exit_code=1, output="SecurityException: not exported")
+        self.p.shell.return_value = shell_result("SecurityException: not exported", 1)
         self.scope["wait_page"] = Mock()
         with self.assertRaisesRegex(RuntimeError, "系统未允许"):
             self.scope["open_page"]("am start", "test/Settings", "设置")
@@ -111,9 +98,9 @@ class Pma110RecipeTests(unittest.TestCase):
         型号与版本喂对：没有段首出口时这条路会走到 `p.off` 才收场，用例才会红。"""
         self.p.locked.return_value = False
         self.p.safe_mode = True
-        self.p.d.shell.side_effect = [SimpleNamespace(output="PMA110"),
+        self.p.shell.side_effect = [shell_result("PMA110", 0),
                                       SimpleNamespace(output="PMA110_17.0.0.106(CN01)")]
-        scope = load(self.p, ["广告跟踪"])
+        scope = load(self.p, RECIPE, ["广告跟踪"])
         self.assertEqual(scope["RESULTS"], [("广告跟踪", "跳过")])
         self.assertEqual(scope["SKIPPED_STEPS"], ["广告跟踪"])
         self.p.off.assert_not_called()
@@ -167,6 +154,41 @@ class Pma110RecipeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "页面变化"):
             self.scope["hide_carousel"]()
         self.p.click.assert_not_called()
+
+
+class Pma110ThemeReopenTests(unittest.TestCase):
+    """主题商店的 `reopen=` 回调（#1371）：这一段转成数据后，「确认后退回设置」那两步写在
+    `close_named_plain` 的实参块里，由库在关完、回读之前调。
+
+    调用序列快照看不到这里（空假页面上 `close_named_plain` 在回读前就停了），所以判据只能是
+    「库真收到了可调用对象，且它跑的是重进隐私页那两步」。旧树也绿，守的是转数据后不回退。
+    """
+
+    def test_the_privacy_page_is_reopened_through_the_library_callback(self):
+        p = fixtures.phone_mock()
+        p.locked.return_value = False
+        calls = []
+
+        def app_settings(phone, rt, package, activity, title):
+            calls.append(("app_settings", title))
+
+        def tap_page(phone, rt, text, activity, **kwargs):
+            calls.append(("tap_page", text))
+
+        def close_named_plain(phone, rt, names, title, *rest, reopen=None, **kwargs):
+            calls.append(("close", title, callable(reopen)))
+            if reopen is not None:
+                reopen()
+
+        fixtures.patch_surface(self, "app_settings", app_settings)
+        fixtures.patch_surface(self, "tap_page", tap_page)
+        fixtures.patch_surface(self, "close_named_plain", close_named_plain)
+        fixtures.load_recipe(p, RECIPE, ["主题商店"])
+
+        self.assertIn(("close", "主题商店·隐私", True), calls)
+        # 隐私页进两次：一次直接进，一次是确认后退回、回读前的重进。
+        self.assertEqual([call for call in calls if call == ("tap_page", "隐私")],
+                         [("tap_page", "隐私"), ("tap_page", "隐私")])
 
 
 if __name__ == "__main__":

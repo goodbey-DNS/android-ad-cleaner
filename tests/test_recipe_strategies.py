@@ -1,15 +1,15 @@
-"""拨动策略的注入面（`tool/recipe_strategies.py`，#1244）：前导调用它、脚本不留逐字副本，
-以及家族库里按脚本常量选走法的那几处（齿轮 / 浏览器设置）。
+"""家族库按脚本常量选走法：`GEAR_STYLE` / `BROWSER_FLOW` / `WAIT_PAGE_STYLE` /
+`READ_SWITCHES_STYLE` / `CLOSE_NAMED_STYLE` / `TAP_STYLE` 各挑一份实现；常量由脚本声明，
+catalog 装载时放进 `rt.constants`（实现按家族住在 `recipe_lib/<家族>.py` 与 `shared.py`）。
 
-判据与 `test_recipe_nav.py` 同形：实现住在工厂里、前导名字按 `g` 现取；脚本侧只留调用点，
-本地同名 `def` 不许再留与注入版逐字相同的副本。走法分派用假手机断言「选了哪一份」与
-「认不出的值当场报错」——静默回退会点错入口，比报错更难查。
+`scope()` 搭一次执行的视图：假手机 + 带常量的 `rt` + 按执行绑好的库函数。分派用例断言「选了
+哪一份」，报错用例守认不出的值当场抛 `RuntimeError`——静默回退会点错入口，比报错更难查
+（#819 的口径）。`StrategyBehaviourTests` 守选中之后的行为：回读确认、落点核对与改动台账。
 """
 import sys
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tool"))
@@ -28,7 +28,6 @@ def scope(**constants):
     import catalog.interpreter as interpreter
     import recipe_runtime
     phone = phone_mock(W=1080, H=2400)
-    phone.d = Mock()
     phone.tree.return_value = ET.fromstring('<hierarchy rotation="0"></hierarchy>')
     phone.on_screen.return_value = True
     rt = recipe_runtime.Runtime(phone)
@@ -109,7 +108,7 @@ class StrategyBehaviourTests(unittest.TestCase):
         after = [("推荐", False, (100, 200)), ("保留项", True, (300, 400))]
         phone.switches.side_effect = [before, before, after]
         g["close_with_plain_tap"](["推荐"], "下载管理·信息流")
-        phone.d.shell.assert_called_once_with("input tap 100 200")
+        phone.shell.assert_called_once_with("input tap 100 200")
         phone.confirm.assert_called_once()
         phone.changed.append.assert_called_once_with(("下载管理·信息流", "推荐"))
 
@@ -126,7 +125,7 @@ class StrategyBehaviourTests(unittest.TestCase):
         phone.tree.return_value = ET.fromstring(GEAR_NODE)
         phone.focus.return_value = "com.android.browser/.BrowserSettingsActivity"
         self.assertTrue(g["gear_tap"]("com.android.browser", "BrowserSettingsActivity"))
-        phone.d.shell.assert_called_once_with("input tap 960 160")
+        phone.shell.assert_called_once_with("input tap 960 160")
 
 
 if __name__ == "__main__":

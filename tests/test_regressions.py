@@ -25,11 +25,12 @@ from fixtures import fake_adb, phone_stub, stub
 def phone():
     p = phone_stub("S")
     p.W, p.H = 1168, 1712
-    p.d = Mock()
+    p.conn.reader = Mock()
     return p
 
 
 class SwitchTests(unittest.TestCase):
+    DOMAIN = "switch"
     def test_titles_deduplicate_rows_and_preserve_auto_update(self):
         root = ET.fromstring('''<hierarchy><node bounds="[0,300][1168,900]">
           <node bounds="[0,320][1168,430]">
@@ -97,7 +98,7 @@ class SwitchTests(unittest.TestCase):
           <node class="android.widget.ImageView" resource-id="app:id/switch" clickable="true" bounds="[2200,500][2300,600]"/>
         </hierarchy>''')
         self.assertEqual(p.switches(root), [])
-        p.d.screenshot.assert_not_called()
+        p.conn.reader.screenshot.assert_not_called()
 
     def test_accessibility_label_on_switch_is_preserved(self):
         root = ET.fromstring('''<hierarchy>
@@ -112,7 +113,7 @@ class SwitchTests(unittest.TestCase):
         p = phone()
         root = ET.fromstring('<hierarchy><node class="android.widget.TextSwitcher" resource-id="app:id/search_text_switcher" content-desc="搜索框" clickable="true" bounds="[50,100][900,200]"/></hierarchy>')
         self.assertEqual(p.switches(root), [])
-        p.d.screenshot.assert_not_called()
+        p.conn.reader.screenshot.assert_not_called()
 
     def test_protection_polarity(self):
         for text in ("限制广告跟踪", "防止广告追踪", "关闭个性化推荐",
@@ -122,6 +123,7 @@ class SwitchTests(unittest.TestCase):
         self.assertIs(fast.want_state("个性化广告推荐"), False)
         self.assertIs(fast.want_state("选择广告推荐"), False)   # 只多认一个动词前缀，不认没否定词的行
         self.assertIsNone(fast.want_state("关闭推送"))
+        self.assertIs(fast.want_state(None), False)   # #1416：没有标题的行不算保护类开关
 
     def test_protection_polarity_traditional(self):
         """繁体界面的同一批保护开关（#604；#498 只覆盖了渠道线词表）。"""
@@ -150,12 +152,13 @@ class SwitchTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    DOMAIN = "navigation"
     def test_no_input_without_visible_focused_edit(self):
         p = phone()
         stub(p, "edit_ready", Mock(return_value=False))
         self.assertFalse(p.type_text("广告"))
-        p.d.assert_not_called()
-        p.d.shell.assert_not_called()
+        p.conn.reader.assert_not_called()
+        p.conn.reader.shell.assert_not_called()
 
     @patch.object(fast.time, "sleep")
     def test_input_rpc_has_timeout_and_verifies_text(self, _sleep):
@@ -163,18 +166,18 @@ class InputTests(unittest.TestCase):
         stub(p, "edit_ready", Mock(return_value=True))
         stub(p, "focused_text", Mock(return_value="广告"))
         self.assertTrue(p.type_text("广告", timeout=0.5))
-        p.d.jsonrpc.setText.assert_called_once_with(p.d.return_value.selector, "广告", http_timeout=0.5)
-        p.d.jsonrpc.setClipboard.assert_not_called()
+        p.conn.reader.jsonrpc.setText.assert_called_once_with(p.conn.reader.return_value.selector, "广告", http_timeout=0.5)
+        p.conn.reader.jsonrpc.setClipboard.assert_not_called()
 
     @patch.object(fast.time, "sleep")
     def test_failed_rpc_uses_bounded_clipboard_then_verifies(self, _sleep):
         p = phone()
         stub(p, "edit_ready", Mock(return_value=True))
-        p.d.jsonrpc.setText.side_effect = TimeoutError()
+        p.conn.reader.jsonrpc.setText.side_effect = TimeoutError()
         stub(p, "focused_text", Mock(return_value="广告"))
         self.assertTrue(p.type_text("广告", timeout=0.5))
-        p.d.jsonrpc.setClipboard.assert_called_once_with(None, "广告", http_timeout=0.5)
-        p.d.shell.assert_called_once_with("input keyevent KEYCODE_PASTE", timeout=0.5)
+        p.conn.reader.jsonrpc.setClipboard.assert_called_once_with(None, "广告", http_timeout=0.5)
+        p.conn.reader.shell.assert_called_once_with("input keyevent KEYCODE_PASTE", timeout=0.5)
 
     @patch.object(fast.time, "sleep")
     def test_unverified_input_returns_false(self, _sleep):
@@ -183,12 +186,12 @@ class InputTests(unittest.TestCase):
         stub(p, "focused_text", Mock(return_value="%%%%"))
         self.assertFalse(p.type_text("广告", timeout=0.5))
         # 退场交给调用方，type_text 不再自己按返回（#639）
-        self.assertNotIn("input keyevent BACK", [c.args[0] for c in p.d.shell.call_args_list])
+        self.assertNotIn("input keyevent BACK", [c.args[0] for c in p.conn.reader.shell.call_args_list])
 
     def search_phone(self, with_result, search_page=False, results=None, exit_code=0):
         """search_page：系统有直达设置搜索页的动作（ColorOS 的 MAIN_SEARCH，#650）。"""
         p = phone()
-        p.reader.shell = Mock(return_value=types.SimpleNamespace(
+        p.conn.reader.shell = Mock(return_value=types.SimpleNamespace(
             exit_code=exit_code,
             output="Starting: Intent" if search_page else "Error: Activity not started, unable to resolve Intent"))
         home = ET.fromstring('<node text="搜索设置项" bounds="[50,100][1100,200]"/>')
@@ -213,7 +216,7 @@ class InputTests(unittest.TestCase):
         p = self.search_phone(True, search_page=True)
         with patch.object(fast.time, "time", side_effect=itertools.count(0, 0.2)), patch.object(fast.time, "sleep"):
             self.assertTrue(p.setting("广告"))
-        commands = [c.args[0] for c in p.reader.shell.call_args_list]
+        commands = [c.args[0] for c in p.conn.reader.shell.call_args_list]
         self.assertIn("am start -f 0x10008000 -a oplus.intent.action.settings.MAIN_SEARCH", commands)
         self.assertNotIn("am start -f 0x10008000 -a android.settings.SETTINGS", commands)
         self.assertEqual(p.clicked.call_count, 1)         # 只点结果，没有找框点框
@@ -222,7 +225,7 @@ class InputTests(unittest.TestCase):
         p = self.search_phone(True)
         with patch.object(fast.time, "time", side_effect=itertools.count(0, 0.2)), patch.object(fast.time, "sleep"):
             self.assertTrue(p.setting("广告"))
-        commands = [c.args[0] for c in p.reader.shell.call_args_list]
+        commands = [c.args[0] for c in p.conn.reader.shell.call_args_list]
         self.assertIn("am start -f 0x10008000 -a android.settings.SETTINGS", commands)
 
     def test_search_action_with_a_nonzero_exit_does_not_count_as_opened(self):
@@ -230,7 +233,7 @@ class InputTests(unittest.TestCase):
         p = self.search_phone(True, search_page=True, exit_code=1)
         with patch.object(fast.time, "time", side_effect=itertools.count(0, 0.2)), patch.object(fast.time, "sleep"):
             self.assertTrue(p.setting("广告"))
-        commands = [c.args[0] for c in p.reader.shell.call_args_list]
+        commands = [c.args[0] for c in p.conn.reader.shell.call_args_list]
         self.assertIn("am start -f 0x10008000 -a android.settings.SETTINGS", commands)
 
     def test_path_picks_the_result_with_that_location(self):
@@ -259,6 +262,7 @@ class InputTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
+    DOMAIN = "startup"
     def setUp(self):
         fake_adb(self)
 
@@ -303,7 +307,7 @@ class LaunchTests(unittest.TestCase):
 
     def test_missing_launcher_stops_before_reading_other_app(self):
         p = phone()
-        p.d.shell.side_effect = [types.SimpleNamespace(exit_code=0, output="No activities found to run, monkey aborted."),
+        p.conn.reader.shell.side_effect = [types.SimpleNamespace(exit_code=0, output="No activities found to run, monkey aborted."),
                                  types.SimpleNamespace(exit_code=0, output="package:/data/app/base.apk")]
         p.screen.texts = Mock()
         with self.assertRaisesRegex(RuntimeError, "无法打开"):
@@ -313,9 +317,9 @@ class LaunchTests(unittest.TestCase):
     def test_reference_recipe_app_not_installed_is_named(self):
         # #87 / #165：参考脚本里的 App 本机没装，说「没有安装」，不报成打开失败。
         p = phone()
-        p.d.shell.side_effect = [types.SimpleNamespace(exit_code=0, output="No activities found to run, monkey aborted."),
+        p.conn.reader.shell.side_effect = [types.SimpleNamespace(exit_code=0, output="No activities found to run, monkey aborted."),
                                  types.SimpleNamespace(exit_code=0, output="")]
-        p.d.app_stop = Mock()
+        p.conn.reader.app_stop = Mock()
         with patch.object(adb_link, "detached", return_value=False):    # 手机还在，只是没装这个 App
             with self.assertRaisesRegex(RuntimeError, "没有安装 com.honor.browser"):
                 p.start("com.honor.browser")
@@ -341,7 +345,7 @@ class LaunchTests(unittest.TestCase):
 
     def test_launch_handles_permission_gate_before_checking_target_foreground(self):
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
         p.screen.focus = Mock(side_effect=["com.android.permissioncontroller/.GrantPermissionsActivity"] * 2 + ["com.example/.Main"] * 3)
         p.screen.texts = Mock(return_value=[("首页", (), None)]); p.dismiss = Mock(return_value="拒绝权限")
         with patch.object(fast.time, "sleep"):
@@ -350,16 +354,16 @@ class LaunchTests(unittest.TestCase):
 
     def test_sparse_homepage_is_not_dismissed_as_an_ad(self):
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Events injected: 1")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Events injected: 1")
         p.screen.focus = Mock(return_value="com.example/.Main")
         p.screen.texts = Mock(return_value=[("首页", (), None), ("我的", (), None)])
         with patch.object(fast.time, "sleep"):
             p.start("com.example", settle=0)
-        self.assertNotIn("input keyevent BACK", [c.args[0] for c in p.d.shell.call_args_list])
+        self.assertNotIn("input keyevent BACK", [c.args[0] for c in p.conn.reader.shell.call_args_list])
 
     def test_late_permission_gate_is_denied_before_accepting_launch(self):
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
         p.screen.focus = Mock(side_effect=["com.example/.Main", "com.android.permissioncontroller/.GrantPermissionsActivity"] + ["com.example/.Main"] * 2)
         p.screen.texts = Mock(return_value=[("首页", (), None)])
         p.dismiss = Mock(return_value="拒绝权限")
@@ -369,7 +373,7 @@ class LaunchTests(unittest.TestCase):
 
     def test_late_permission_without_deny_button_stops(self):
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
         # 失败消息现在带落点（#547）
         p.screen.focus = Mock(side_effect=["com.example/.Main", "com.android.permissioncontroller/.GrantPermissionsActivity",
                                     "com.android.permissioncontroller/.GrantPermissionsActivity"])
@@ -382,7 +386,7 @@ class LaunchTests(unittest.TestCase):
 
     def test_start_leaving_target_app_stops_before_dismiss_or_click(self):
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Events injected: 1")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Events injected: 1")
         # 失败消息现在带落点（#547）：多读一次前台，页面结构也要读得到。
         # 连续 3 帧读到别的 App 才判离开（#581），落点那一次再多读一次。
         p.screen.focus = Mock(side_effect=["com.example/.Main"] + ["com.other/.Account"] * 4)
@@ -397,7 +401,7 @@ class LaunchTests(unittest.TestCase):
     def test_leaving_foreground_error_carries_the_actual_landing_page(self):
         # #547：「启动后离开前台」命中 79 份上报、51 个型号，缺的都是「是谁盖住了」。
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Events injected: 1")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Events injected: 1")
         p.screen.focus = Mock(side_effect=["com.example/.Main", "com.other/.Account"] + ["com.other/.Account"] * 4)
         p.screen.texts = Mock(return_value=[])
         p.screen.tree = Mock(return_value=ET.fromstring('<hierarchy rotation="0"></hierarchy>'))
@@ -410,7 +414,7 @@ class LaunchTests(unittest.TestCase):
     def test_never_entered_foreground_error_carries_the_actual_landing_page(self):
         # #547：另一条短路（deadline 到了还没到目标包）同样带上落点。
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
         p.screen.focus = Mock(side_effect=["com.other/.Account"] * 20)
         p.screen.tree = Mock(return_value=ET.fromstring('<hierarchy rotation="0"></hierarchy>'))
         p.screen.texts = Mock(return_value=[])
@@ -421,7 +425,7 @@ class LaunchTests(unittest.TestCase):
 
     def test_dismiss_leaving_target_app_is_not_accepted_as_success(self):
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Events injected: 1")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Events injected: 1")
         # 失败消息现在带落点（#547）；连续 3 帧读到别的 App 才算离开（#581）
         p.screen.focus = Mock(side_effect=["com.example/.Main"] * 3 + ["com.other/.Main"] * 4)
         p.screen.texts = Mock(return_value=[("首页", (), None)])
@@ -433,27 +437,27 @@ class LaunchTests(unittest.TestCase):
 
     def test_slow_blank_start_waits_for_page_without_pressing_back(self):
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
         p.screen.focus = Mock(return_value="com.example/.Main")
         p.screen.texts = Mock(side_effect=[[], [], [("首页", (), None)]])
         p.dismiss = Mock(return_value=None)
         with patch.object(fast.time, "time", side_effect=itertools.count(0, .5)), patch.object(fast.time, "sleep"):
             p.start("com.example", settle=0)
-        self.assertNotIn("input keyevent BACK", [c.args[0] for c in p.d.shell.call_args_list])
+        self.assertNotIn("input keyevent BACK", [c.args[0] for c in p.conn.reader.shell.call_args_list])
 
     def test_unreadable_start_is_bounded_and_does_not_press_back(self):
         p = phone()
-        p.d.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(exit_code=0, output="Starting")
         p.screen.focus = Mock(return_value="com.example/.Main")
         p.screen.texts = Mock(return_value=[]); p.dismiss = Mock(return_value=None)
         with patch.object(fast.time, "time", side_effect=itertools.count()), patch.object(fast.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "仍读不到页面"):
                 p.start("com.example")
-        self.assertNotIn("input keyevent BACK", [c.args[0] for c in p.d.shell.call_args_list])
+        self.assertNotIn("input keyevent BACK", [c.args[0] for c in p.conn.reader.shell.call_args_list])
 
     def test_recipe_declared_failures_return_failure_after_preserving_change_log(self):
         p = phone(); p.locked = Mock(return_value=False)
-        p.d.shell.return_value = types.SimpleNamespace(output="test-build")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output="test-build")
         p.changed = [("已成功的页面", "个性化推荐")]
         with tempfile.TemporaryDirectory() as directory:
             recipe = Path(directory) / "recipe.toml"
@@ -468,7 +472,7 @@ class LaunchTests(unittest.TestCase):
     def test_toml_build_mismatch_reaches_safe_mode(self):
         p = phone()
         p.locked = Mock(return_value=False)
-        p.d.shell.return_value = types.SimpleNamespace(output="different-version")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output="different-version")
         with tempfile.TemporaryDirectory() as d:
             recipe = Path(d) / "recipe.toml"
             recipe.write_text('model = "x"\nmodels = ["x"]\nbuild = "old-version"\n'
@@ -481,7 +485,7 @@ class LaunchTests(unittest.TestCase):
     def test_toml_matching_build_stays_out_of_safe_mode(self):
         p = phone()
         p.locked = Mock(return_value=False)
-        p.d.shell.return_value = types.SimpleNamespace(output="old-version")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output="old-version")
         with tempfile.TemporaryDirectory() as d:
             recipe = Path(d) / "recipe.toml"
             recipe.write_text('model = "x"\nmodels = ["x"]\nbuild = "old-version"\n'
@@ -495,7 +499,7 @@ class LaunchTests(unittest.TestCase):
         # run.py 用 --ref 传下来，不再靠 AAC_REF 环境变量
         p = phone()
         p.locked = Mock(return_value=False)
-        p.d.shell.return_value = types.SimpleNamespace(output="OS4.0")
+        p.conn.reader.shell.return_value = types.SimpleNamespace(output="OS4.0")
         with tempfile.TemporaryDirectory() as d:
             recipe = Path(d) / "recipe.toml"
             recipe.write_text('model = "x"\nmodels = ["x"]\n[[segment]]\nname = "a"\nops = []\n', encoding="utf-8")
@@ -512,6 +516,12 @@ class LaunchTests(unittest.TestCase):
             self.assertTrue(path)
             self.assertFalse(reference)
         self.assertFalse(run.build_ok({"build": "PD2547B_A_17.1.10.2", "os": "OriginOS 7"}, "PD2547D_A_16"))
+
+
+class PackagingEntryTests(unittest.TestCase):
+    DOMAIN = "desktop"
+    def setUp(self):
+        fake_adb(self)
 
     def test_packaged_child_uses_cli_dispatch(self):
         with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", "/tmp/app"):
@@ -544,6 +554,7 @@ class LaunchTests(unittest.TestCase):
 
 class TapIconTests(unittest.TestCase):
     """没有文字的图标入口：游戏中心 14.43.3 把「设置」做成「我的」页右上角的齿轮（#292）。"""
+    DOMAIN = "navigation"
 
     PAGE = '''<hierarchy>
       <node clickable="true" bounds="[980,120][1080,240]"/>
@@ -610,7 +621,7 @@ class TapIconTests(unittest.TestCase):
     def test_tap_icon_prints_page_text_when_no_icon_works(self):
         p = self.page_phone()
         Clock = self.clock()
-        p.log = True
+        p.conn.log = True
         stub(p, "find", Mock(return_value=None))
         p.screen.texts = Mock(return_value=[("我的游戏", (0, 0, 1, 1), None)])
         out = io.StringIO()

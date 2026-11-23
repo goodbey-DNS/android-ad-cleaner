@@ -6,7 +6,24 @@
 两个前端发来的 JSON 形状不变。
 """
 import dataclasses
+from enum import StrEnum
 from typing import Any, get_origin, get_type_hints
+
+
+class StepKind(StrEnum):
+    """这一步是什么身份：六种，排任务、重试对齐与结果页判据共用这一个词。
+
+    成员本身就是 `str`（`StepKind.RECIPE == "recipe"`、序列化与字典键都与字面量互通），所以
+    `result["kind"]` 进 status-json、进上报、进 coverage_note 的字符串比较全部原样成立。
+    增删一种身份必须显式改这里与 `tests/test_plan.py` 的冻结用例。
+    """
+
+    BACKUP = "backup"
+    ADS = "ads"
+    RECIPE = "recipe"
+    CHANNELS = "channels"
+    QUICKAPP = "quickapp"
+    FINISH = "finish"
 
 
 @dataclasses.dataclass
@@ -51,9 +68,9 @@ class Plan:
     def __getitem__(self, name: str) -> Any:
         """按字段名读：`p["steps"]` 与 `p.steps` 同义。
 
-        生产代码一律用属性；留着下标读法是为了既有用例——`retry_plan()` 的返回从字典换成对象时，
-        照旧拿 `plan["steps"]` 断言的用例不用改写（#1106）。它只实现按名字读这一半，`in` 与迭代
-        不跟着变成字典语义。
+        生产代码一律用属性；`retry_plan()` 的返回从字典换成对象时，照旧拿 `plan["steps"]` 断言的
+        用例不用改写（沿用 #1106 的做法，见 `tests/test_result_retry.py`）。它只实现按名字读这一半，
+        `in` 与迭代不跟着变成字典语义。
         """
         if name not in {f.name for f in dataclasses.fields(self)}:
             raise KeyError(name)

@@ -18,17 +18,17 @@ sys.path.insert(0, str(ROOT / "tool"))
 sys.path.insert(0, str(ROOT / "tests"))
 import fast
 import run
-from fixtures import load_recipe, phone_mock
+from fixtures import shell_result, load_recipe, phone_mock
+import recipe_case
+from recipe_case import walk
 
 RECIPE = ROOT / "recipes/xiaomi/2505APX7BC/2505APX7BC.toml"
 EXCEPTIONS = ROOT / "recipes/xiaomi/2505APX7BC/2505APX7BC.py"
 STEPS = ["系统广告", "应用商店", "手机管家", "下载管理", "主题", "浏览器", "全局搜索", "负一屏", "天气和日历"]
 
 
-class MixFlip2RecipeTests(unittest.TestCase):
-    def setUp(self):
-        self.path = RECIPE
-        self.source = self.path.read_text(encoding="utf-8")
+class MixFlip2RecipeTests(recipe_case.RecipeSourceCase):
+    RECIPE = RECIPE
 
     def phone(self, focus=""):
         p = phone_mock()
@@ -69,16 +69,19 @@ class MixFlip2RecipeTests(unittest.TestCase):
 
     def test_bottom_tabs_go_through_tab_not_go_or_tap(self):
         # 这台的第 5 个底栏标签在 y≈94% 屏高；p.tap() 会先命中内容区同名文字（#305 / #386）。
-        # 数据里走 `require_tab`（门面的 p.tab）；例外函数里点「我的」也只调 p.tab。
+        # 主题段与商店段都要到「我的」页，两处都走 `require_tab`（门面的 p.tab）。
         data = tomllib.loads(self.source)
         tabs = [op for segment in data["segment"] for op in segment.get("ops", [])
                 if op.get("kind") == "require_tab" and op.get("name") == "我的"]
-        self.assertEqual(len(tabs), 1, "主题段要到「我的」页：数据里应有 require_tab")
+        self.assertEqual(len(tabs), 2, "主题段与商店段都要到「我的」页：数据里应有 require_tab")
+        elsewhere = [op for segment in data["segment"] for op in segment.get("ops", [])
+                     if op.get("kind") in {"go", "tap"} and op.get("text") == "我的"]
+        self.assertEqual(elsewhere, [], "点「我的」不走 p.go / p.tap")
         called = {n.func.attr for n in ast.walk(ast.parse(EXCEPTIONS.read_text(encoding="utf-8")))
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                   and n.func.attr in {"tab", "go", "tap", "entry"}
                   and any(isinstance(a, ast.Constant) and a.value == "我的" for a in n.args)}
-        self.assertEqual(called, {"tab"})
+        self.assertEqual(called, set(), "商店段转数据后，例外函数里不再点「我的」")
 
     def test_browser_opens_settings_from_my_tab_and_does_not_touch_the_menu(self):
         # 这台底栏是 主页/视频/AI搜索/免费小说/我的，没有「菜单」（票面实测）
@@ -115,7 +118,7 @@ class MixFlip2RecipeTests(unittest.TestCase):
 
     def test_theme_settings_entry_is_the_text_button_on_the_my_page(self):
         p = self.phone("com.android.thememanager/.ThemePreferenceActivity")
-        p.d.shell.return_value.output = "package:/data/app/themestore/base.apk"
+        p.shell.return_value = shell_result("package:/data/app/themestore/base.apk")
         p.tab.return_value = True
         p.tap.return_value = True
         p.expect_page.return_value = True
@@ -129,7 +132,7 @@ class MixFlip2RecipeTests(unittest.TestCase):
     def test_theme_settings_page_that_does_not_open_fails_the_step(self):
         # 落点判据看页面上的项：页面没画出这些项就报失败
         p = self.phone("com.android.thememanager/.ThemePreferenceActivity")
-        p.d.shell.return_value.output = "package:/data/app/themestore/base.apk"
+        p.shell.return_value = shell_result("package:/data/app/themestore/base.apk")
         p.tab.return_value = True
         p.tap.return_value = True
         p.expect_page.return_value = False
@@ -169,7 +172,7 @@ class MixFlip2RecipeTests(unittest.TestCase):
         p.off.assert_not_called()
         self.assertEqual(out.getvalue().count("本版无此类开关"), 2)
         self.assertNotIn("没有可识别的设置入口", out.getvalue())
-        p.d.shell.assert_any_call(
+        p.shell.assert_any_call(
             "am start -f 0x10008000 -n com.android.calendar/.settings.CalendarActionbarSettingsActivity")
 
     def test_weather_that_does_not_reach_its_settings_page_fails_instead_of_claiming_no_switches(self):
@@ -198,7 +201,7 @@ class MixFlip2RecipeTests(unittest.TestCase):
     def test_every_switch_page_names_the_switches_it_touches(self):
         # 不整页全关：每一条 off 都点名 only（整页全关要显式写 page_wide / close_all）。
         data = tomllib.loads(self.source)
-        offs = [op for segment in data["segment"] for op in _walk(segment.get("ops", []))
+        offs = [op for segment in data["segment"] for op in walk(segment.get("ops", []))
                 if op.get("kind") in ("off", "off_required")]
         self.assertTrue(offs)
         for op in offs:
@@ -211,13 +214,6 @@ class MixFlip2RecipeTests(unittest.TestCase):
         self.assertIn(("浏览器·搜索设置", ("显示猜你想搜模块",),
                        ("扫一扫", "AI搜索", "搜索历史", "搜索引擎切换栏")), named)
 
-
-def _walk(ops):
-    """展开带分支的 op（if_entry / if_lib_any …）里的子表。"""
-    for op in ops:
-        yield op
-        yield from _walk(op.get("ops", []))
-        yield from _walk(op.get("else_ops", []))
 
 
 if __name__ == "__main__":

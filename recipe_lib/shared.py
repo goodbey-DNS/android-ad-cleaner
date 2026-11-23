@@ -16,7 +16,7 @@ from recipe_runtime import SkipStep
 from phone.errors import ScreenLocked
 from row import bounds, icon_hit
 
-__all__ = ('app_settings', 'browser_settings', 'close_named', 'enter', 'gear', 'gear_top', 'goto', 'my_tab', 'open_page', 'open_settings', 'opened', 'page_activity', 'read_switches', 'switch_signature', 'switch_top', 'tap', 'tap_text', 'wait_page', 'wait_switches')
+__all__ = ('app_settings', 'browser_settings', 'close_named', 'direct_page', 'direct_start', 'enter', 'gear', 'gear_top', 'goto', 'my_tab', 'open_page', 'open_settings', 'opened', 'page_activity', 'read_switches', 'switch_signature', 'switch_top', 'tap', 'tap_text', 'wait_page', 'wait_switches')
 
 # ---------- 词汇 ----------
 def _style(rt, constant, choices, default):
@@ -261,13 +261,13 @@ def open_settings(p, rt, *args, **kwargs):
         return p.tap_icon(list(expect))
     def intent_style(package, activity, title):
         """公开设置 Intent 直达，落点交给同名助手 `page()` 判（脚本把它绑到 page_activity）。"""
-        out = p.d.shell("am start -f 0x10008000 -a oppo.intent.action.APP_SETTINGS -p " + package)
+        out = p.shell("am start -f 0x10008000 -a oppo.intent.action.APP_SETTINGS -p " + package)
         if out.exit_code or any(x in out.output for x in ("Error", "Exception", "Permission Denial")):
             return False
         return page_activity(p, rt, activity, title)
     def shell_style(package, activity, title):
         """公开设置 Intent 直达 App 设置页，核对前台 Activity 与页标题。"""
-        result = p.d.shell(rt.constants['SETTINGS_INTENT'].format(package))
+        result = p.shell(rt.constants['SETTINGS_INTENT'].format(package))
         rt.require(not result.exit_code and not any(m in result.output for m in rt.constants['SETTINGS_REFUSED']),
                      f"{package}：系统不允许直达设置，未操作（{result.output.strip()[-200:]}）")
         rt.require(p.expect_page(title), f"{package}：设置页未打开；{p.page_evidence()}")
@@ -284,13 +284,13 @@ def open_settings(p, rt, *args, **kwargs):
 
 def open_page(p, rt, *args, **kwargs):
     def fields_style(command, title, package, activity=None):
-        result = p.d.shell(command)
+        result = p.shell(command)
         rt.require(not result.exit_code and not any(word in result.output for word in
                       ("Error", "Exception", "Permission Denial", "unable to resolve")),
                      "系统未允许打开设置页")
         rt.page(title, package, activity)
     def shell_style(command, activity, title=None):
-        result = p.d.shell(command)
+        result = p.shell(command)
         rt.require(not result.exit_code and not re.search(
             r"Error|Exception|Permission Denial|unable to resolve", result.output, re.I),
             f"系统未允许打开「{title or activity}」，未继续操作")
@@ -483,20 +483,53 @@ def tap(p, rt, name, scrolls=None):
         return exact_style(name, scrolls)
     return require_style(name, scrolls)
 
-def opened(p, rt, start):
-    """试一条直达页面：到了返回真。别的系统版本可能没有这一页，返回假走菜单；
-    断线照常上抛——跑到一半掉线时 Phone 只置 lost、抛的是普通 RuntimeError（沿用 #293 的做法）。"""
+def opened(p, rt, start, dead_ends=None):
+    """试一条直达页面：到了返回真。别的系统版本可能没有这一页，返回假由调用方收场；
+    断线与约定跳过照常上抛——跑到一半掉线时 Phone 只置 lost、抛的是普通 RuntimeError
+    （沿用 #293 的做法）。
+
+    `ScreenLocked` 也一并放行，但这一支是给将来会抛它的调用方留的：当前 `p.start` 落点不对时抛的
+    是普通 `RuntimeError`，锁屏只在 `rt.page` 与段前检查里抛，这里不能当成「这条路不通」换个入口
+    接着做（#1372）。
+
+    `dead_ends` 给「这条路在这台机上不通」的报错文案片段，按**包含**匹配：引擎的拉起报错是
+    包名加原始输出（`无法打开 com.x：… No activities found …`、`… 没有进入前台（停在 …）`），
+    全等匹配永远对不上整句。不写 = 任何非断线的 RuntimeError 都算不通。"""
     try:
         start()
         return True
-    except (adb_link.DeviceLost, SkipStep):
-        # 跳过（App 本机没装 / 按约定不跑）不是「这条路不通」：放行，由段包装记跳过（沿用 #908 的做法）
+    except (adb_link.DeviceLost, SkipStep, ScreenLocked):
+        # 跳过（App 本机没装 / 按约定不跑）不是「这条路不通」：放行，由段包装记跳过（沿用 #908 的做法）。
+        # `ScreenLocked` 现为防御性分支：`p.start` 不抛它，见 docstring。
         raise
     except RuntimeError as e:
         if p.lost:
             raise
-        print(f"  · 直达不通（{e}），走菜单")
+        if dead_ends and not any(mark in str(e) for mark in dead_ends):
+            raise
+        print(f"  · 直达不通（{e}）")
         return False
+
+def direct_start(p, rt, pkg, activity=None, expect=None, dead_ends=None, budget=None):
+    """直达某个 App 页面（广告隐私页 / 主题商店 / App 首页）：到了返回真，不通返回假。
+
+    与 `direct_page` 的区别只在等待预算：App 首屏比设置页慢，`budget` 不写就用启动器的缺省
+    （设置页那种「要么立刻出现要么根本没有」的才写 2 秒）。调用方按返回假去走菜单或跳过；
+    `dead_ends` 的读法见 `opened()`。"""
+    args = (pkg,) if activity is None else (pkg, activity)
+    kwargs = {"expect": expect} if expect is not None else {}
+    if budget is not None:
+        kwargs["budget"] = budget
+    return opened(p, rt, lambda: p.start(*args, **kwargs), dead_ends=dead_ends)
+
+def direct_page(p, rt, pkg, activity, expect=None, dead_ends=None):
+    """设置页能直达就直达（商店设置 / 系统广告服务 / 全局搜索 / 阅图锁屏）：到了返回真。
+
+    设置页要么立刻出现要么根本没有，判据等 2 秒；App 页面用 `direct_start`。
+    直达不通返回假，由调用方按菜单路径回退；断线 / 锁屏 / 约定跳过照常上抛（沿用 #293 / #908）。
+    包名与页面名由数据传进来：`tool/entries.py` 按调用点的这两个实参认入口速查，写死在这里它看不见。"""
+    return direct_start(p, rt, pkg, activity, expect=expect or None, dead_ends=dead_ends,
+                        budget=2 if expect else None)
 
 def my_tab(p, rt, *args, **kwargs):
     honor_style = functools.partial(_honor_my_tab, p, rt)
@@ -528,7 +561,7 @@ def browser_settings(p, rt):
         直达入口可能复用旧子页；只从已识别的浏览器设置子页返回，不清数据或历史。
         命令串按 `rt.constants['BROWSER_PREFS']` 拼：这一档的入口只属于这台机，事实层按调用方的常量
         还原，别的家族导入同一个 `browser_settings` 时读不出这条入口（#1245）。"""
-        result = p.d.shell("am start -n " + rt.constants['BROWSER_PREFS'])
+        result = p.shell("am start -n " + rt.constants['BROWSER_PREFS'])
         rt.require(not result.exit_code and "Error" not in result.output, "浏览器设置未打开")
         rt.clock.sleep(.5)
         for _ in range(4):
@@ -560,13 +593,13 @@ def browser_settings(p, rt):
 
         实测冷启动会直接停在首页，底部只有菜单/窗口，没有「我的」，走「我的」会整段跑空。"""
         try:
-            p.d(resourceId="com.vivo.browser:id/menu_btn").click()
+            p.tap_id("com.vivo.browser:id/menu_btn")
             rt.clock.sleep(1.4)
             if p.tap("设置", exact=True, scrolls=0, wait=1.3) and "SettingActivity" in p.focus():
                 return True
         except Exception:
             pass
-        p.d.shell("input keyevent BACK")
+        p.shell("input keyevent BACK")
         rt.clock.sleep(0.8)
         if p.tap("我的", exact=True, scrolls=4, wait=1.2):     # 兜底：「我的」页顶部也有设置入口
             p.top()

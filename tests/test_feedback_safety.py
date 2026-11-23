@@ -93,7 +93,7 @@ class PhotoSpotTests(unittest.TestCase):
         with patch.object(chan, "parse", return_value=self.state()):
             result = chan.toggle(p, "com.example", "recommend", False, "活动优惠")
         self.assertEqual(result.kind, chan.PROTECTED)
-        p.d.shell.assert_not_called()
+        p.conn.reader.shell.assert_not_called()
         p.click.assert_not_called()
 
     def test_targeted_restore_of_protected_notification_is_still_allowed(self):
@@ -112,6 +112,9 @@ class PhotoSpotTests(unittest.TestCase):
 
     def test_low_level_restore_can_enable_protected_channel(self):
         p = Mock(); p.locked.return_value = False
+        # 镜像桩：唯一执行点的点击落到点击原语，深链意图交给 Mock 自己吞掉
+        p.apply.side_effect = (lambda intent: p.click(*intent.at)
+                               if intent.kind == chan.IntentKind.TAP else None)
         with patch.object(chan, "parse", side_effect=[self.state(on=False), self.state()]), \
              patch.object(chan.ChannelPage, "refresh", return_value=chan.Reached(("允许通知", False, (500, 500)))), \
              patch.object(chan, "disabled_at", return_value=False), \

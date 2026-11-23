@@ -23,7 +23,14 @@ from row import bounds
 import wait
 
 MODEL = "ALN-AL00"
-BUILD = "ALN-AL00 4.2.0.223(C00E215R5P16)"
+# 逐个列出有证据的 build，不按分支通配：同分支的其它补丁号没人跑过（#1449）。
+BUILDS = (
+    # 2026-10-30 在本工具上做过路径实测（沿用 #330 记录的那台）。
+    "ALN-AL00 4.2.0.223(C00E215R5P16)",
+    # 报告者用一份按 resource-id 过滤的临时实现跑出 87 条清单关 84 条、清单外 0 条（#1449），
+    # 页面结构与上一行同形；本工具在这个 build 上还没有跑过。
+    "ALN-AL00 4.2.0.223(C00E215R4P16)",
+)
 APP_PAGE = "com.android.settings/com.android.settings.Settings$AppNotificationSettingsActivity"
 HEADER = "com.android.settings:id/entity_header_title"
 CHECKBOX = "com.android.settings:id/checkboxWidget"
@@ -82,8 +89,8 @@ def permission_mode(reader, package):
 def require_device(reader):
     model = reader.shell("getprop ro.product.model").output.strip()
     build = reader.shell("getprop ro.build.display.id").output.strip()
-    if model != MODEL or build != BUILD:
-        raise ValueError(f"仅适配 {MODEL} / {BUILD}；当前版本未验证，未修改")
+    if model != MODEL or build not in BUILDS:
+        raise ValueError(f"仅适配 {MODEL} / {'、'.join(BUILDS)}；当前版本未验证，未修改")
 
 
 def guard(before, apps_before, current, apps, allowed):
@@ -121,8 +128,8 @@ def checkbox(phone, app, name):
 
 
 def open_app(phone, item):
-    phone.d.shell("am start -f 0x10008000 -a android.settings.APP_NOTIFICATION_SETTINGS"
-                  " --es android.provider.extra.APP_PACKAGE " + shlex.quote(item.package))
+    phone.shell("am start -f 0x10008000 -a android.settings.APP_NOTIFICATION_SETTINGS"
+                " --es android.provider.extra.APP_PACKAGE " + shlex.quote(item.package))
 
     def sample():
         if phone.focus() != APP_PAGE:
@@ -185,7 +192,7 @@ def execute(serial, items, want_on=False, verify=False, phone=None, reader=None)
     result = Result()
     if not items:
         return result
-    if phone is not None and phone.serial != serial:
+    if phone is not None and phone.conn.serial != serial:
         raise ValueError("读屏设备和指定序列号不一致，未修改")
     reader = reader or ShellPhone(serial)
     if not verify:
@@ -253,9 +260,9 @@ def execute(serial, items, want_on=False, verify=False, phone=None, reader=None)
                     continue
                 print(("即将恢复：" if want_on else "即将关闭：") + item.app + " / " + name, flush=True)
                 left, top, right, bottom = bounds(node)
-                if active.locked() or tuple(active.d.window_size()) != (active.W, active.H):
+                if active.locked() or tuple(active.window_size()) != (active.W, active.H):
                     raise RuntimeError("锁屏或尺寸变化，未使用旧坐标")
-                active.d.shell(f"input tap {(left + right)//2} {(top + bottom)//2}")
+                active.shell(f"input tap {(left + right)//2} {(top + bottom)//2}")
                 time.sleep(.3)
                 after, apps = parse(reader)
                 guard(before, apps_before, after, apps, allowed)
@@ -268,7 +275,7 @@ def execute(serial, items, want_on=False, verify=False, phone=None, reader=None)
                     active.changed.append((item.app, name))
                 else:
                     result.failed.append(item.app + " / " + name + "：回读未确认")
-        active.d.shell("input keyevent HOME")
+        active.shell("input keyevent HOME")
     finally:
         try:
             if owned and active is not None:

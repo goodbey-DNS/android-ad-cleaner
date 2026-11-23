@@ -8,13 +8,13 @@
 <meta property="og:title" content="手机版教程 · 肉呆去广告">
 <meta property="og:description" content="在手机上一键关广告：3 个设置 + 一键，截图和视频一步一步讲。">
 <meta name="theme-color" content="#EBEFEC">
-<link rel="icon" href="images/roudai-icon.png?v=0.4.4">
+<link rel="icon" href="images/roudai-icon.png?v=0.4.5">
 <style>
 /* site-css:start */
 /* 官网两页（index.html / android-tutorial.html）共用的调色板、深色档、顶栏与页脚（#653）。
-   单一来源：tool/gen_site_css.py 把它渲染进两页 <style> 的 site-css 标记区，页面不引用本文件——
+   单一来源：devtools/gen_site_css.py 把它渲染进两页 <style> 的 site-css 标记区，页面不引用本文件——
    GitHub Pages 与机主服务器上的单文件副本都只认页面里内联的那份。
-   改完跑 python tool/gen_site_css.py；漏跑由 tests/test_doc_consistency.py 抓。
+   改完跑 python devtools/gen_site_css.py；漏跑由 tests/test_doc_consistency.py 抓。
    两页在共享样式上的差异值集中在下面的 :root.reading 一条里：教程页是阅读页，版心与栏高比首页收紧一档。
    本文件只管共享部分；页面专属样式（含两页各自的 h2 / .lead 字号与宽度、页脚链接下划线）留在各自 <style> 里。 */
 
@@ -158,7 +158,7 @@ section { padding-block: 80px; border-top: 1px solid var(--line); scroll-margin-
 
 <header class="top">
   <div class="wrap">
-    <a class="brand" href="index.html"><img class="logo" src="images/roudai-icon.png?v=0.4.4" alt="">肉呆去广告</a>
+    <a class="brand" href="index.html"><img class="logo" src="images/roudai-icon.png?v=0.4.5" alt="">肉呆去广告</a>
     <nav class="nav" aria-label="页面导航">
       <a href="#step1" class="hide-s">教程</a>
       <a href="#after" class="hide-s">之后</a>

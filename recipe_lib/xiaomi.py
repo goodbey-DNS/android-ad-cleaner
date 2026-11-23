@@ -10,7 +10,7 @@ from recipe_runtime import SkipStep
 from recipe_lib.shared import _style, close_named_step, gear, maybe, opened, read_switches
 from row import bounds, icon_hit
 
-__all__ = ('bottom_tab', 'browser_settings_xiaomi', 'browser_start', 'by_id', 'close_with_plain_tap', 'direct_settings', 'downloads', 'downloads_probe', 'downloads_tap', 'gear_tap', 'global_search', 'menu_settings', 'mine_settings', 'negative_screen', 'popup_row', 'security_center', 'security_tab', 'settings_icon_visible', 'store', 'store_mode', 'system_ads_security', 'tab', 'tab_bot', 'tap_any', 'tap_bottom_tab', 'tap_low', 'tap_tab', 'theme', 'theme_settings', 'wait_bottom_tab', 'weather_calendar_probe', 'weather_calendar_tap')
+__all__ = ('bottom_tab', 'browser_settings_xiaomi', 'browser_start', 'by_id', 'close_with_plain_tap', 'direct_settings', 'downloads', 'downloads_probe', 'downloads_tap', 'gear_tap', 'global_search', 'menu_settings', 'mine_settings', 'mine_tab_low', 'negative_screen', 'popup_row', 'security_center', 'security_tab', 'settings_icon_visible', 'store', 'store_mode', 'store_mode_step', 'store_privacy_nested', 'store_privacy_sub', 'system_ads_menu', 'system_ads_security', 'tab', 'tab_bot', 'tap_any', 'tap_bottom_tab', 'tap_low', 'tap_tab', 'theme', 'theme_settings', 'wait_bottom_tab', 'weather_calendar_probe', 'weather_calendar_tap')
 
 # ---------- 词汇 ----------
 def tap_any(p, rt, *names, scrolls=6):
@@ -93,12 +93,8 @@ def browser_settings_xiaomi(p, rt):
                 return True
             if p.focus() != before:
                 p.back()
-        for text, (l, t, r, b), _node in p.texts():
-            if text == "我的" and t >= p.H * 0.65:
-                before = p.sig()
-                p.click((l + r) // 2, (t + b) // 2)
-                p.settle(before, 1.5)
-                return gear(p, rt)
+        if mine_tab_low(p, rt):
+            return gear(p, rt)
         return False
     def menu_flow():
         """底栏「菜单」→ 弹窗「设置」；底栏没有「菜单」的机型在「我的」页里找设置（沿用 #833）。
@@ -137,7 +133,7 @@ def browser_start(p, rt):
         except RuntimeError as e:
             if attempt or "离开前台" not in str(e):
                 raise
-            p.d.shell("am force-stop com.android.browser")
+            p.shell("am force-stop com.android.browser")
             rt.clock.sleep(1.5)
     return False
 
@@ -195,6 +191,18 @@ def bottom_tab(p, rt, name='我的'):
             return True
     return False
 
+def mine_tab_low(p, rt, name='我的'):
+    """点下半屏（65% 屏高以下）的「我的」：底栏不在最下面那道带（`p.H * 0.85`）时 `p.tab()` 够不着。
+
+    内容区里也常有一行同名文字，所以只认这一条带、按读到的位置点；点完等页面换掉（首页要画几秒）。"""
+    for text, (l, t, r, b), _node in p.texts():
+        if text == name and t >= p.H * 0.65:
+            before = p.sig()
+            p.click((l + r) // 2, (t + b) // 2)
+            p.settle(before, 1.5)
+            return True
+    return False
+
 def by_id(p, rt, rid, wait=1.5):
     """按 resource-id 点控件：这台浏览器工具栏和弹窗里各有一个叫「设置」的图标，按文字会点错。"""
     t0 = rt.clock.time()
@@ -213,7 +221,7 @@ def tap_low(p, rt, name, tries=3):
     for _ in range(tries):
         if p.tap(name, exact=True, scrolls=0):
             return True
-        p.d.shell("input swipe 600 2000 600 1700 150"); rt.clock.sleep(0.7)
+        p.shell("input swipe 600 2000 600 1700 150"); rt.clock.sleep(0.7)
     return False
 
 def settings_icon_visible(p, rt):
@@ -320,7 +328,7 @@ def close_with_plain_tap(p, rt, names, page):
         xy = next((xy for t, on, xy in p.switches() if t == title and on), None)
         if not xy:
             raise RuntimeError(f"{page}：目标开关位置未识别，停止本页")
-        p.d.shell(f"input tap {xy[0]} {xy[1]}")
+        p.shell(f"input tap {xy[0]} {xy[1]}")
         rt.clock.sleep(0.5)
         p.confirm()
     after = {title: on for title, on, _ in p.switches()}
@@ -343,7 +351,7 @@ def gear_tap(p, rt, pkg, activity):
             l, t, r, b = bounds(n)
             if not p.on_screen(n):
                 continue
-            p.d.shell(f"input tap {(l + r) // 2} {(t + b) // 2}")
+            p.shell(f"input tap {(l + r) // 2} {(t + b) // 2}")
             rt.clock.sleep(1.2)
             return p.focus().split("/", 1)[0] == pkg and activity in p.focus()
     return False
@@ -419,7 +427,7 @@ def downloads_tap(p, rt):
     p.back(3)
 
 def theme(p, rt):
-    if "package:" not in p.d.shell("pm path com.android.thememanager").output:
+    if "package:" not in p.shell("pm path com.android.thememanager"):
         print("  · 本机没有主题管理包，跳过"); return
     rt.start_or_skip("com.android.thememanager", ".ThemeResourceProxyTabActivity",
                        dead_ends=rt.constants['THEME_DEAD_ENDS'], reason="主题页打不开")
@@ -483,14 +491,30 @@ def weather_calendar_probe(p, rt):
                   page=f"{pkg}·用户体验计划"); p.back()
         p.back(3)
 
+def store_privacy_nested(p, rt):
+    """商店「隐私设置」页的「个性化服务」是不是子页入口：开关不在本页就是（#1364）。
+
+    4.129.s.00 之后它是子页入口、开关在下一层，更早的版本开关就在本页。点名的开关名单留在
+    数据 / 调用点的 `p.off(only=…)` 里，这里只回答「要不要多进一层」。"""
+    return not any("个性化服务" in t for t, _, _ in p.switches())
+
+def store_privacy_sub(p, rt):
+    """点「隐私设置」页里的「个性化服务」子页入口（上一条判为子页时才调）。"""
+    return maybe(p, rt, "个性化服务")
+
+def store_mode_step(p, rt):
+    """商店「模式切换 → 极简模式」（M154FF / 23049RAD8C）：新版商店没有这一项。"""
+    if maybe(p, rt, "模式切换"):
+        p.tap("极简模式", exact=True, scrolls=0); p.confirm(); p.back()
+
 def store(p, rt):
     p.start("com.xiaomi.market")
     p.go("我的", "设置")
     gear(p, rt)
     if tap_any(p, rt, "隐私设置", "隐私"):
         # 「个性化服务」可能是子页入口，开关在下一层。
-        nested = not any("个性化服务" in t for t, _, _ in p.switches())
-        if not nested or maybe(p, rt, "个性化服务"):
+        nested = store_privacy_nested(p, rt)
+        if not nested or store_privacy_sub(p, rt):
             p.off(only=["个性化服务", "个性化推荐"], page="商店·个性化服务")
             if nested:
                 p.back()
@@ -506,24 +530,46 @@ def store_mode(p, rt):
     gear(p, rt)
     if tap_any(p, rt, "隐私设置", "隐私"):
         # 「个性化服务」可能是子页入口，开关在下一层。
-        nested = not any("个性化服务" in t for t, _, _ in p.switches())
-        if not nested or maybe(p, rt, "个性化服务"):
+        nested = store_privacy_nested(p, rt)
+        if not nested or store_privacy_sub(p, rt):
             p.off(only=["个性化服务"], page="商店·个性化服务")
             if nested:
                 p.back()
         p.back()
-    if maybe(p, rt, "模式切换"):                        # 新版商店没有这一项
-        p.tap("极简模式", exact=True, scrolls=0); p.confirm(); p.back()
+    store_mode_step(p, rt)
     if maybe(p, rt, "通知设置"):
         # 只关「新手帮助」。不碰「推送消息」：它是父开关，关了会连点赞/评论消息一起关
         p.off(only=["新手帮助"], keep=["推送消息", "应用更新"], page="商店·通知设置"); p.back()
     p.back(2)
 
 def system_ads_security(p, rt):
-    p.d.shell("am start -f 0x10008000 -a android.settings.SETTINGS")
+    p.shell("am start -f 0x10008000 -a android.settings.SETTINGS")
     rt.clock.sleep(1.2)
     rt.require(p.tap("隐私与安全", exact=True, scrolls=6), "未找到「隐私与安全」")
     rt.require(security_tab(p, rt), "未识别「安全」标签")
     rt.require(p.tap("更多安全设置", exact=True, scrolls=6), "未找到「更多安全设置」")
     rt.require(p.tap("广告服务", exact=True, scrolls=6), "未找到「广告服务」")
     close_named_step(p, rt, ["个性化广告推荐"], "系统·广告服务")
+
+def system_ads_menu(p, rt, security_tab_first=False):
+    """按「设置 → 隐私与安全 → 更多安全设置 → 广告服务」走一遍，到得了广告服务页才算成。
+
+    与 `system_ads_security` 是两条路：那条每一步都硬校验（点不到就整段失败），这条是软失败，
+    调用方按返回值决定还动不动开关。`security_tab_first` 给隐私页首屏没有「更多安全设置」的机型：
+    它要先把顶部的「安全」标签切过去，切完页面还要再画几秒，所以按页里的内容轮询三次、没画出来
+    就再点一次；其余机型先按文字翻「更多安全设置」，翻不到才去切标签。"""
+    p.shell("am start -f 0x10008000 -a android.settings.SETTINGS")
+    rt.clock.sleep(1.2)
+    if not maybe(p, rt, "隐私与安全"):
+        return False
+    if security_tab_first:
+        for _ in range(3):
+            if p.find("设备安全") or p.find("人身安全"):
+                break
+            p.tap("安全", exact=True, scrolls=0)
+            rt.clock.sleep(0.5)
+        if not maybe(p, rt, "更多安全设置"):
+            return False
+    elif not maybe(p, rt, "更多安全设置") and maybe(p, rt, "安全", scrolls=3):
+        maybe(p, rt, "更多安全设置")
+    return maybe(p, rt, "广告服务")
